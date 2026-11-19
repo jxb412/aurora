@@ -6,7 +6,7 @@ import { parse as parseToml, stringify as stringifyToml } from 'smol-toml';
 type OwnedJson = 'claude-onboarding-v1';
 export interface PermissionScope { kind: 'codex-execution-v1' | 'claude-execution-v1'; profile?: string }
 export interface PlannedFile { path: string; before: string; after: string; existed: boolean; ownedJson?: OwnedJson; permissionScope?: PermissionScope | null }
-interface BackupEntry { path: string; backup: string | null; installedHash: string; originalHash?: string; originalAbsent?: true; ownedJson?: OwnedJson; permissionScope?: PermissionScope }
+interface BackupEntry { path: string; backup: string | null; installedHash: string; codexRuntimeHash?: string; originalHash?: string; originalAbsent?: true; ownedJson?: OwnedJson; permissionScope?: PermissionScope }
 interface BackupManifest { format: 'aurora-client-backup-v1'; agentId: string; files: BackupEntry[] }
 
 export const digest = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -85,8 +85,29 @@ function onboardingObject(text: string): Record<string, any> {
   } catch { throw new Error('Claude 引导配置不是有效的 JSON 对象，已停止修改'); }
 }
 function withoutOnboarding(value: Record<string, any>): Record<string, any> { const { hasCompletedOnboarding: _, ...rest } = value; return rest; }
+/** Ignore only the desktop-generated pipe UUID, never other TOML bytes or MCP fields. */
+export function codexRuntimeHash(file: string, text: string): string | undefined {
+  if (path.basename(file) !== 'config.toml') return undefined;
+  try {
+    const parsed: any = parseToml(text.replace(/^\uFEFF/, ''));
+    const value = parsed.mcp_servers?.node_repl?.env?.SKY_CUA_NATIVE_PIPE_DIRECTORY;
+    const prefix = '\\\\.\\pipe\\codex-computer-use-';
+    if (typeof value !== 'string' || !value.startsWith(prefix) || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.slice(prefix.length))) return undefined;
+    let section = '', count = 0;
+    const normalized = text.split(/(?<=\n)/).map(line => {
+      if (/^\s*\[/.test(line)) section = line.trim();
+      if (section !== '[mcp_servers.node_repl.env]') return line;
+      return line.replace(/^(\s*SKY_CUA_NATIVE_PIPE_DIRECTORY\s*=\s*)(["'])([^\r\n]*?)\2(?=\s*(?:#.*)?\r?\n?$)/, (_match, start, quote) => {
+        count++; return start + quote + '__CODEX_RUNTIME_PIPE_UUID__' + quote;
+      });
+    }).join('');
+    if (count !== 1 || (parseToml(normalized) as any).mcp_servers?.node_repl?.env?.SKY_CUA_NATIVE_PIPE_DIRECTORY !== '__CODEX_RUNTIME_PIPE_UUID__') return undefined;
+    return digest(normalized);
+  } catch { return undefined; }
+}
 function installedMatches(entry: BackupEntry, current: string): boolean {
-  return entry.ownedJson ? onboardingObject(current).hasCompletedOnboarding === true : digest(current) === entry.installedHash;
+  if (entry.ownedJson) return onboardingObject(current).hasCompletedOnboarding === true;
+  return digest(current) === entry.installedHash || !!entry.codexRuntimeHash && codexRuntimeHash(entry.path, current) === entry.codexRuntimeHash;
 }
 function restoredContent(entry: BackupEntry, current: string): string | null {
   const originalText = entry.backup ? readText(entry.backup) : null;
@@ -111,6 +132,7 @@ function loadManifest(file: string, agentId: string, allowed: string[]): BackupM
   for (const e of manifest.files) {
     if (!e || typeof e.path !== 'string' || !/^[a-f0-9]{64}$/.test(e.installedHash) || (e.originalHash !== undefined && (e.backup === null || !/^[a-f0-9]{64}$/.test(e.originalHash))) || (e.backup !== null && typeof e.backup !== 'string') || !allowed.some(p => path.resolve(p) === path.resolve(e.path)) || (e.backup !== null && !isWithin(root, e.backup)))
       throw new Error('备份包含不属于此客户端的文件');
+    if (e.codexRuntimeHash !== undefined && (agentId !== 'codex-cli' || path.basename(e.path) !== 'config.toml' || !/^[a-f0-9]{64}$/.test(e.codexRuntimeHash))) throw new Error('运行时配置校验记录无效');
     if (e.originalAbsent !== undefined && (e.originalAbsent !== true || e.backup !== null)) throw new Error('备份中的原始配置不存在记录无效');
     if (e.backup !== null) checkBackupFile(root, e.backup);
     validateOwnership(agentId, e, allowed);
@@ -200,7 +222,8 @@ export function applyPlan(agentId: string, files: PlannedFile[], previousBackup?
       else originalAbsent = true;
     }
     const permissionScope = f.permissionScope === undefined ? old?.permissionScope : f.permissionScope;
-    manifest.files.push({ path: f.path, backup: backup ?? null, installedHash: digest(f.after), ...(originalHash ? { originalHash } : {}), ...(originalAbsent ? { originalAbsent } : {}), ...(f.ownedJson ? { ownedJson: f.ownedJson } : {}), ...(permissionScope ? { permissionScope } : {}) });
+    const runtimeHash = agentId === 'codex-cli' ? codexRuntimeHash(f.path, f.after) : undefined;
+    manifest.files.push({ path: f.path, backup: backup ?? null, installedHash: digest(f.after), ...(runtimeHash ? { codexRuntimeHash: runtimeHash } : {}), ...(originalHash ? { originalHash } : {}), ...(originalAbsent ? { originalAbsent } : {}), ...(f.ownedJson ? { ownedJson: f.ownedJson } : {}), ...(permissionScope ? { permissionScope } : {}) });
   }
   const manifestPath = path.join(root, `${agentId}-${stamp}.json`);
   atomicWrite(manifestPath, JSON.stringify(manifest, null, 2));

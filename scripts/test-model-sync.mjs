@@ -45,7 +45,41 @@ try {
     assert.deepEqual(current.models.map(m => m.id), ['existing', 'remove-me', 'good', 'bounded']);
     assert.equal(current.models[2].contextWindow, undefined); assert.equal(current.models[3].contextWindow, 32000);
   }, { data: [null, 5, { id: 12 }, { id: 'bad\nid' }, { id: 'good', context_window: -1 }, { id: 'good' }, { name: 'models/bounded', inputTokenLimit: 32000 }] });
+  await check('显式 reasoning 元数据规范化且不覆盖本地或并发能力设置', p => store.saveProvider({ ...p,
+    models: [{ id: 'existing', capabilities: { tools: true, thinking: false } }, { id: 'remove-me' }] }), (result, current) => {
+    assert.equal(result.ok, true);
+    const models = Object.fromEntries(current.models.map(model => [model.id, model]));
+    assert.deepEqual(models.existing.capabilities, { tools: true, thinking: false });
+    assert.equal(models['remove-me'].capabilities.thinking, true);
+    assert.equal(models['gpt-6.2-sol'].capabilities.thinking, true);
+    assert.equal(models['explicit-off'].capabilities.thinking, false);
+    assert.equal(models['capability-off'].capabilities.thinking, false);
+    assert.equal(models['unknown-reasoning'].capabilities, undefined);
+  }, { data: [
+    { id: 'existing', reasoning: true }, { id: 'remove-me', capabilities: { reasoning: true } },
+    { id: 'gpt-6.2-sol', reasoning: true }, { id: 'explicit-off', reasoning: false },
+    { id: 'capability-off', capabilities: { thinking: false, reasoning: true }, reasoning: true },
+    { id: 'unknown-reasoning', reasoning: 'true' },
+  ] });
   const original = store.saveProvider.bind(store);
+  await check('Image capability metadata preserves explicit and concurrent local choices', p => store.saveProvider({ ...p,
+    models: [{ id: 'existing', capabilities: { tools: true, vision: false } }, { id: 'remove-me' }] }), (result, current) => {
+    assert.equal(result.ok, true);
+    const models = Object.fromEntries(current.models.map(model => [model.id, model]));
+    assert.deepEqual(models.existing.capabilities, { tools: true, vision: false });
+    assert.equal(models['remove-me'].capabilities.vision, true);
+    assert.equal(models['modality-image'].capabilities.vision, true);
+    assert.equal(models['modality-text'].capabilities.vision, false);
+    assert.equal(models['explicit-off'].capabilities.vision, false);
+    assert.equal(models['nested-image'].capabilities.vision, true);
+    for (const id of ['unknown', 'invalid', 'empty']) assert.equal(models[id].capabilities, undefined);
+  }, { data: [
+    { id: 'existing', vision: true }, { id: 'remove-me', capabilities: { vision: true } },
+    { id: 'modality-image', input_modalities: ['text', 'image'] }, { id: 'modality-text', input_modalities: ['text'] },
+    { id: 'explicit-off', capabilities: { vision: false }, input_modalities: ['text', 'image'] },
+    { id: 'nested-image', architecture: { input_modalities: ['text', 'image'] } },
+    { id: 'unknown' }, { id: 'invalid', vision: 'true', input_modalities: [null] }, { id: 'empty', input_modalities: [] },
+  ] });
   try {
     await check('Local persistence errors remain explicit without retrying another endpoint', () => { store.saveProvider = () => { throw new Error('fixture full disk'); }; }, (result, current) => {
       assert.equal(result.ok, false); assert.match(result.message, /本地保存失败/); assert.equal(current.models.length, 2);

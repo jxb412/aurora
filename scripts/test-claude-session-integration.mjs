@@ -5,7 +5,8 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { build } from 'esbuild';
 
-const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'yunqiao-claude-history-')));
+// The scanner returns native canonical paths, including expansion of Windows 8.3 TEMP aliases.
+const temporary = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'yunqiao-claude-history-')));
 const saved = process.env.AURORA_CLIENT_HOME;
 let count = 0;
 try {

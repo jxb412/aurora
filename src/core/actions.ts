@@ -6,9 +6,12 @@ import { activeRequests } from './gateway/liveUsage.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { applyContextDefaults, isChatgptTextModel, isValidContextWindow } from './modelContext.js';
-import { readText, atomicWrite, digest, expectedPlanFiles, planned, restorePlanSnapshot } from './agents/configFiles.js';
+import { readText, atomicWrite, digest, expectedPlanFiles, planned, restorePlanSnapshot, type PlannedFile } from './agents/configFiles.js';
 import { runPermissionAction } from './agents/permissions.js';
 import { getCoexistCatalog } from './gateway/coexist.js';
+import { buildGatewayModelCatalog } from './agents/modelCatalog.js';
+import { planGatewayModelCatalog, serializeGatewayModelCatalog } from './agents/catalogStorage.js';
+import { readHistoryModelCoverage } from './agents/historyModelCoverage.js';
 import { runExtensionAction } from './extensions/index.js';
 import { AGENT_ADAPTERS, detectReset, getAdapter, connectionParameters, exportEnvScript, configureDesktopPath, codexPlan, planRevision, type ConnectContext } from './agents/adapters.js';
 import { detectAllAsync, detectDesktopAsync } from './agents/detectionAsync.js';
@@ -33,8 +36,8 @@ import { GITHUB_RELEASE_PAGE } from './releaseSources.js';
 import { providerBalance } from './providerBalance.js';
 import { diagnoseClient } from './clientDiagnostics.js';
 import { testClientConnection, cancelClientConnectionTest } from './clientConnectionTest.js';
-import { prepareClientHistory, recoverClientHistory, applyClientHistory, historyPreviewRevision, clientConnectionRevision, CODEX_STATE_IDS, type PreparedClientHistory } from './agentHistory.js';
-import type { HistoryContext } from './historyRepairIO.js';
+import { prepareClientHistory, recoverClientHistory, applyClientHistory, historyPreviewRevision, clientConnectionRevision, clientHistoryContext, CODEX_STATE_IDS, type PreparedClientHistory } from './agentHistory.js';
+import { assertClientsStopped, type HistoryContext } from './historyRepairIO.js';
 import { discoverHistoryProviderIds } from './agents/historyProviders.js';
 
 /**
@@ -66,6 +69,18 @@ function rememberHistoryProviders(deps: ActionDeps, configPath: string, revision
   const key = historyProviderSnapshotKey(deps, configPath, revision); historyProviderSnapshots.delete(key);
   while (historyProviderSnapshots.size >= 128) historyProviderSnapshots.delete(historyProviderSnapshots.keys().next().value!);
   historyProviderSnapshots.set(key, Object.freeze([...ids]));
+}
+interface GatewayCatalogPreviewSnapshot {
+  enabled: boolean;
+  clientRevision: string;
+  connectionRevision: string;
+  catalog?: { path: string; existed: boolean; beforeDigest: string; afterDigest: string; revision: string };
+}
+const gatewayCatalogSnapshots = new Map<string, GatewayCatalogPreviewSnapshot>();
+function rememberGatewayCatalog(deps: ActionDeps, configPath: string, revision: string, snapshot: GatewayCatalogPreviewSnapshot) {
+  const key = historyProviderSnapshotKey(deps, configPath, revision); gatewayCatalogSnapshots.delete(key);
+  while (gatewayCatalogSnapshots.size >= 128) gatewayCatalogSnapshots.delete(gatewayCatalogSnapshots.keys().next().value!);
+  gatewayCatalogSnapshots.set(key, structuredClone(snapshot));
 }
 function snapshotClientFiles(paths: string[]): ClientFileSnapshot[] {
   return paths.map(file => ({ path: file, content: readText(file), existed: fs.existsSync(file) }));
@@ -251,7 +266,14 @@ export async function fetchProviderModels(deps: ActionDeps, payload: { providerI
         const id = rawId.replace(/^models\//, '').trim();
         if (!id || id.length > 512 || /[\s\u0000-\u001f]/.test(id)) return [];
         const context = x.context_window ?? x.input_token_limit ?? x.inputTokenLimit;
-        return [{ id, ...(isValidContextWindow(context) ? { contextWindow: context } : {}) }];
+        const thinking = [x.capabilities?.thinking, x.capabilities?.reasoning, x.reasoning].find(value => typeof value === 'boolean');
+        const explicitVision = [x.capabilities?.vision, x.vision, x.supports_vision].find(value => typeof value === 'boolean');
+        const modalities = [x.input_modalities, x.architecture?.input_modalities, x.modalities?.input]
+          .find(value => Array.isArray(value) && value.length && value.every(item => typeof item === 'string' && item.length));
+        const vision = explicitVision ?? (modalities ? modalities.includes('image') : undefined);
+        const capabilities = { ...(typeof thinking === 'boolean' ? { thinking } : {}), ...(typeof vision === 'boolean' ? { vision } : {}) };
+        return [{ id, ...(isValidContextWindow(context) ? { contextWindow: context } : {}),
+          ...(Object.keys(capabilities).length ? { capabilities } : {}) }];
       });
       if (models.length) {
         // A network response must not restore a deleted provider or overwrite edits made while it was loading.
@@ -264,6 +286,11 @@ export async function fetchProviderModels(deps: ActionDeps, payload: { providerI
           if (index >= 0) {
             // Existing explicit limits are local choices; synchronization never replaces them.
             if (merged[index].contextWindow === undefined && isChatgptTextModel(m.id)) merged[index] = applyContextDefaults({ ...merged[index], contextWindow: m.contextWindow });
+            for (const capability of ['thinking', 'vision'] as const) {
+              if (merged[index].capabilities?.[capability] === undefined && m.capabilities?.[capability] !== undefined) {
+                merged[index] = { ...merged[index], capabilities: { ...merged[index].capabilities, [capability]: m.capabilities[capability] } };
+              }
+            }
           } else if (!(startedModels.has(m.id) && !current.models.some(x => x.id === m.id))) merged.push(applyContextDefaults(m));
         }
         let savedModels = merged;
@@ -566,11 +593,66 @@ export async function runAction(deps: ActionDeps, action: string, payload: any):
         historyProviderIds,
       };
       const reviewedConnectionRevision = sharedCodex ? clientConnectionRevision(deps) : '';
+      let nativeCatalog = coexist?.nativeCatalog;
+      let catalogPlan: PlannedFile | undefined;
+      let compatibleModelSettings = false;
+      let acceptedCatalogDowngrade = false;
+      let validateCatalogPreview: (() => void) | undefined;
+      if (sharedCodex && authMode === 'api' && context.mode === 'gateway' && action !== 'agent.parameters') {
+        // A native catalog is optional. Missing metadata, busy/unreadable history or
+        // an occupied catalog path must never prevent ordinary API configuration.
+        compatibleModelSettings = true;
+        const snapshot = action === 'agent.connect' && typeof payload.revision === 'string'
+          ? gatewayCatalogSnapshots.get(historyProviderSnapshotKey(deps, configPath, payload.revision)) : undefined;
+        try {
+          // Keep a reviewed compatibility plan stable when the client exits or metadata appears.
+          const candidate = snapshot?.enabled === false ? undefined : buildGatewayModelCatalog(provider);
+          if (snapshot?.enabled) {
+            // Only a verified optional-catalog change may reuse the original preview revision.
+            // Payload choices, actual config bytes, provider state, catalog bytes and model
+            // metadata must still describe exactly the plan the customer reviewed.
+            validateCatalogPreview = () => {
+              const original = snapshot.catalog;
+              const live = buildGatewayModelCatalog(store.getProvider(provider.id)!);
+              const current = original && live ? planned(original.path, serializeGatewayModelCatalog(live)) : undefined;
+              if (!original || !current || clientConnectionRevision(deps) !== snapshot.connectionRevision
+                || current.existed !== original.existed || digest(current.before) !== original.beforeDigest || digest(current.after) !== original.afterDigest
+                || planRevision(codexPlan({ ...context, modelCatalogPath: original.path, gatewayModelCatalog: true })) !== snapshot.clientRevision
+                || planRevision([current]) !== original.revision)
+                throw new Error('配置或模型目录在预览后已变化，请重新预览再应用');
+            };
+            validateCatalogPreview();
+          }
+          if (candidate?.models.some(model => model.slug === `${provider.id}/${context.model}`)) {
+            const configuration = readText(configPath);
+            let compatibleHistory = false;
+            try {
+              const historyContext = clientHistoryContext(deps);
+              // Starting a client after preview is harmless while current read-only
+              // history evidence remains compatible. Otherwise use ordinary settings.
+              if (!snapshot?.enabled) await assertClientsStopped(historyContext);
+              compatibleHistory = readHistoryModelCoverage(configuration, historyContext.home, historyContext.sqliteHome, candidate, `${provider.id}/${context.model}`).safe;
+            } catch { /* Optional history evidence selects the ordinary configuration path. */ }
+            if (compatibleHistory) {
+              catalogPlan = snapshot?.catalog ? planned(snapshot.catalog.path, serializeGatewayModelCatalog(candidate))
+                : planGatewayModelCatalog(store.dir, candidate, configuration, { reuseManagedCurrent: !!context.previousBackup });
+              nativeCatalog = candidate;
+              context.modelCatalogPath = catalogPlan.path;
+              context.gatewayModelCatalog = true;
+              compatibleModelSettings = false;
+            } else if (snapshot?.enabled) acceptedCatalogDowngrade = true;
+          }
+        } catch (error) {
+          if (snapshot?.enabled) return { ok: false, message: String((error as Error).message) };
+          // Keep the working configuration path and the selected root context limits.
+        }
+      }
+      if (coexist) catalogPlan = planned(context.modelCatalogPath!, JSON.stringify(coexist.nativeCatalog, null, 2));
       const preview: ReturnType<typeof adapter.preview> & { history?: PreparedClientHistory['history'] } = adapter.preview(context);
       const clientRevision = preview.revision;
-      // A coexistence apply also publishes the model catalog. Bind that content
-      // to the review even when a changed model limit leaves config.toml identical.
-      if (coexist && clientRevision) preview.revision = digest(JSON.stringify({ clientRevision, nativeCatalog: coexist.nativeCatalog }));
+      if (compatibleModelSettings) preview.warnings.push('将保留客户端原生能力，并使用当前所选模型的上下文与 90% 自动压缩设置；配置仍可正常保存。');
+      // 将目录内容和磁盘快照一起绑定到预览，防止目录独立修改后覆盖外部工作。
+      if (catalogPlan && clientRevision) preview.revision = digest(JSON.stringify({ clientRevision, catalogRevision: planRevision([catalogPlan]) }));
       let history: PreparedClientHistory | undefined;
       if (sharedCodex && preview.ok && action !== 'agent.parameters') {
         const prepared = await prepareClientHistory(deps, codexPlan(context)[0].after, action === 'agent.preview');
@@ -578,26 +660,41 @@ export async function runAction(deps: ActionDeps, action: string, payload: any):
         if (clientConnectionRevision(deps) !== reviewedConnectionRevision) return { ...preview, ok: false, message: '供应商或连接状态在检查期间已变化，请重新预览' };
         preview.revision = historyPreviewRevision(preview.revision, history, reviewedConnectionRevision);
       }
-      if (action === 'agent.preview' && sharedCodex && preview.ok && preview.revision) rememberHistoryProviders(deps, configPath, preview.revision, context.historyProviderIds || []);
+      if (action === 'agent.preview' && sharedCodex && preview.ok && preview.revision) {
+        rememberHistoryProviders(deps, configPath, preview.revision, context.historyProviderIds || []);
+        if (authMode === 'api' && context.mode === 'gateway' && clientRevision) rememberGatewayCatalog(deps, configPath, preview.revision,
+          { enabled: context.gatewayModelCatalog === true, clientRevision, connectionRevision: reviewedConnectionRevision,
+            ...(catalogPlan ? { catalog: { path: catalogPlan.path, existed: catalogPlan.existed, beforeDigest: digest(catalogPlan.before),
+              afterDigest: digest(catalogPlan.after), revision: planRevision([catalogPlan]) } } : {}) });
+      }
       if (action === 'agent.preview' || !preview.ok) return preview;
       if (action === 'agent.parameters') return { ok: true, ...connectionParameters(context, adapter.protocol), script: exportEnvScript(context, adapter.protocol), note: adapter.supportNote };
       if (context.mode === 'gateway' && !deps.gatewayStatus().running) return { ok: false, message: '本地网关未运行，请先启动网关后再应用配置' };
-      if (context.expectedRevision && context.expectedRevision !== preview.revision) return { ok: false, message: '配置或连接参数在预览后已变化，请重新预览再应用' };
+      if (context.expectedRevision && context.expectedRevision !== preview.revision && !acceptedCatalogDowngrade) return { ok: false, message: '配置或连接参数在预览后已变化，请重新预览再应用' };
       // The adapter independently checks only its client-file plan.
       context.expectedRevision = clientRevision;
       const catalogFile = context.modelCatalogPath!;
       if (history) {
         const files = codexPlan(context);
         if (planRevision(files) !== clientRevision) return { ok: false, message: '配置在检查历史期间已变化，请重新预览' };
-        if (coexist) files.push(planned(catalogFile, JSON.stringify(coexist.nativeCatalog, null, 2)));
+        if (catalogPlan) files.push(catalogPlan);
         return await applyClientHistory(deps, {
           prepared: history, files,
           revalidate: () => {
-            if (clientConnectionRevision(deps) !== reviewedConnectionRevision || planRevision(codexPlan(context)) !== clientRevision || (coexist && digest(JSON.stringify(getCoexistCatalog(store).nativeCatalog)) !== digest(JSON.stringify(coexist.nativeCatalog))))
+            validateCatalogPreview?.();
+            const liveCatalog = coexist ? getCoexistCatalog(store).nativeCatalog : nativeCatalog ? buildGatewayModelCatalog(store.getProvider(provider.id)!) : undefined;
+            if (nativeCatalog && !coexist) {
+              const historyContext = clientHistoryContext(deps);
+              if (!liveCatalog || !readHistoryModelCoverage(readText(configPath), historyContext.home, historyContext.sqliteHome, liveCatalog, `${provider.id}/${context.model}`).safe)
+                throw new Error('模型或历史预算在预览后变化，请重新预览');
+            }
+            const liveCatalogText = coexist ? JSON.stringify(liveCatalog, null, 2) : liveCatalog ? serializeGatewayModelCatalog(liveCatalog as NonNullable<ReturnType<typeof buildGatewayModelCatalog>>) : '';
+            if (clientConnectionRevision(deps) !== reviewedConnectionRevision || planRevision(codexPlan(context)) !== clientRevision
+              || (catalogPlan && (planRevision([planned(catalogFile, liveCatalogText)]) !== planRevision([catalogPlan]))))
               throw new Error('配置或模型目录在检查后已变化');
           },
           commit: () => {
-            if (coexist) atomicWrite(catalogFile, files[1].after, { existed: files[1].existed, content: files[1].before });
+            if (catalogPlan) atomicWrite(catalogFile, catalogPlan.after, { existed: catalogPlan.existed, content: catalogPlan.before });
             return adapter.connect(context);
           },
           states: result => CODEX_STATE_IDS.map(id => ({ id, connected: true, pendingReapply: false, providerId: provider.id, model: context.model,

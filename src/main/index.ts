@@ -10,6 +10,7 @@ import { selectClientDesktop } from './clientDesktopSelection.js';
 import { runtimeFor } from '../core/extensions/runtime.js';
 import { syncLocalClients } from '../core/localClients.js';
 import { getCoexistCatalog, isCodexCoexistConfigured } from '../core/gateway/coexist.js';
+import { refreshGatewayModelCatalog } from '../core/agents/modelCatalog.js';
 import { GatewayServer, resetGateway } from '../core/gateway/server.js';
 import { runAction, type ActionDeps } from '../core/actions.js';
 import type { UsageRecord } from '../core/store/types.js';
@@ -43,8 +44,8 @@ function refreshLocalClients(force = false) {
     if (isCodexCoexistConfigured(store)) {
       const catalog = getCoexistCatalog(store).nativeCatalog;
       if (JSON.stringify(catalog) !== JSON.stringify(store.readExtra('codex-model-catalog.json', null))) store.writeExtra('codex-model-catalog.json', catalog);
-    }
-  } catch { localClientWarnings.push('共存模型目录更新未完成，请检查数据目录的空间和写入权限；上次目录仍保留。'); }
+    } else refreshGatewayModelCatalog(store);
+  } catch { localClientWarnings.push('模型目录更新未完成，请检查供应商设置、数据目录的空间和写入权限；上次目录仍保留。'); }
   try { refreshTray(); } catch { /* Existing window can still display the actionable scan warning. */ }
   if (win && !win.isDestroyed()) win.webContents.send('aurora:gateway', status());
 }

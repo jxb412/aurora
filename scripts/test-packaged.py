@@ -513,6 +513,8 @@ def main():
             if not args.expect_history_deferred:
                 history_fixture['assert_provider'](history_target)
             assert limits['model_context_window'] == 272000 and limits['model_auto_compact_token_limit'] == 244800
+            assert 'model_catalog_json' not in limits, 'Missing native metadata must preserve native fallback instead of inventing a catalog'
+
             def assert_legacy_provider_routes(configuration):
                 providers = configuration.get('model_providers', {})
                 for legacy_id in ['retired-provider', 'missing-region-0', 'missing-region-1', history_target]:
@@ -550,7 +552,7 @@ def main():
             assert limits['model_context_window'] == 200000 and limits['model_auto_compact_token_limit'] == 180000
             assert_legacy_provider_routes(limits)
             assert (clients / '.codex/auth.json').read_bytes() == original[clients / '.codex/auth.json']
-            checks.append('Native configuration apply and reapply write 272000/244800 then 200000/180000, preserve official auth and shared CLI state; history defers without writes for a running client or completes verified raw-file/database backups for an idle client')
+            checks.append('Native configuration apply and reapply write 272000/244800 then 200000/180000 when native metadata is unavailable, preserve official auth and shared CLI state; history defers without writes for a running client or completes verified raw-file/database backups for an idle client')
             before_restore = history_fixture['snapshot']()
             restored = page.evaluate("() => window.aurora.invoke('agent.disconnect', {agentId:'chatgpt-desktop'})")
             if args.expect_history_deferred:

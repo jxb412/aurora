@@ -29,7 +29,7 @@ try {
     const provider = { id: 'fixture-provider', name: 'Fixture', format: 'openai-responses', baseUrl: 'https://fixture.invalid/v1', enabled: true,
       apiKeys: [{ id: 'fixture-key', label: 'Fixture', key: 'fixture-api-secret', enabled: true, weight: 1 }],
       models: [{ id: 'unselected-model', contextWindow: 1000000 }, { id: 'selected-model', ...(contextWindow === undefined ? {} : { contextWindow }) }] };
-    const ctx = { provider, model: 'selected-model', gatewayUrl: 'http://127.0.0.1:3425', token: 'fixture-gateway-token', mode: 'gateway', authMode: 'api', modelCatalogPath: path.join(scratch, label, 'catalog.json') };
+    const ctx = { provider, model: 'selected-model', gatewayUrl: 'http://127.0.0.1:3425', token: 'fixture-gateway-token', mode: 'gateway', authMode: 'api' };
     return { config, client, ctx, original: text };
   }
   const preview = f => { const p = adapter.preview(f.ctx); assert.equal(p.ok, true, p.message); return p; };
@@ -90,7 +90,7 @@ try {
     assert.equal(parse(read(unknown.config)).model_auto_compact_token_limit, undefined);
   });
   check('coexistence removes stale global overrides so catalog models use their own windows and triggers', () => {
-    const f = fixture('coexist'); f.ctx.authMode = 'coexist';
+    const f = fixture('coexist'); f.ctx.authMode = 'coexist'; f.ctx.modelCatalogPath = path.join(scratch, 'coexist', 'catalog.json');
     const auth = path.join(f.client, '.codex', 'auth.json');
     const token = `fixture.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.fixture`;
     const originalAuth = JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: token, refresh_token: 'fixture-refresh-private', account_id: 'fixture-account' } });

@@ -12,6 +12,7 @@ import { readOfficialCodexIdentity, codexCoexistBaseUrl, CODEX_COEXIST_BASE_PATH
 import { codexHistoryBasePath } from '../gateway/historyRoute.js';
 import { nativeDirectParameters } from './directConnection.js';
 import { discoverHistoryProviderIds, detachManagedHistoryProviders, withHistoryProviderAliases, clearManagedHistoryTarget } from './historyProviders.js';
+import { isGatewayCatalogPath, readManagedGatewayModelCatalog } from './catalogStorage.js';
 import { applyPlan, restorePlan, backupPlanFiles, jsonObject, planned, plannedJson, readText, patchToml, patchEnv, redactConfig, digest, type PlannedFile } from './configFiles.js';
 
 export interface ConnectContext {
@@ -28,6 +29,8 @@ export interface ConnectContext {
   permissionMode?: 'preserve' | 'full-access';
   skipOnboarding?: boolean;
   modelCatalogPath?: string;
+  /** Enabled only after native metadata and historical model budgets have been verified. */
+  gatewayModelCatalog?: boolean;
   /** Trusted read-only worker result supplied by the action layer, never copied from renderer payload. */
   desktopDetection?: CodingDesktopDetection;
   /** Trusted main-process preview snapshot, never copied from renderer fields. */
@@ -211,6 +214,11 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
   try { current = parseToml(before.replace(/^\uFEFF/, '')); }
   catch { throw new Error('原 Codex 配置不是有效的 TOML，已停止修改；请在原客户端检查配置。'); }
   const coexist = ctx.authMode === 'coexist';
+  const gatewayCatalog = !coexist && ctx.mode === 'gateway' && ctx.gatewayModelCatalog === true && !!ctx.modelCatalogPath;
+  const ownedApiCatalog = (value: unknown) => typeof value === 'string' && !!ctx.modelCatalogPath
+    && (!!readManagedGatewayModelCatalog(value, path.dirname(ctx.modelCatalogPath))
+      // A known prior connection can detach a missing/edited catalog without owning its current bytes.
+      || !!ctx.previousBackup && isGatewayCatalogPath(value, path.dirname(ctx.modelCatalogPath)));
   if (!coexist) {
     const profile = typeof current.profile === 'string' ? current.profiles?.[current.profile] : undefined;
     if ([current.model_providers?.yunqiao, profile?.model_providers?.yunqiao].some(value => value && typeof value === 'object' && (Object.hasOwn(value, 'auth') || Object.hasOwn(value, 'aws')))) {
@@ -246,7 +254,11 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
       routing.model_auto_compact_token_limit = defaultAutoCompactTokenLimit(contextWindow)!;
     }
     if (ownEndpoint(current.openai_base_url)) routing.openai_base_url = null;
-    if (current.model_catalog_json === ctx.modelCatalogPath) routing.model_catalog_json = null;
+    if (gatewayCatalog) {
+      routing.model_catalog_json = ctx.modelCatalogPath!;
+      routing.model_context_window = null;
+      routing.model_auto_compact_token_limit = null;
+    } else if (current.model_catalog_json === ctx.modelCatalogPath || ownedApiCatalog(current.model_catalog_json)) routing.model_catalog_json = null;
   }
   const detached = detachManagedHistoryProviders(before);
   let text = patchToml(detached.text, '', routing);
@@ -257,10 +269,10 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
     if (ctx.permissionMode === 'full-access') Object.assign(values, { approval_policy: 'never', sandbox_mode: 'danger-full-access', default_permissions: null });
     // These transport/catalog fields belong at the root; legacy profile schemas reject them.
     if (profile.openai_base_url !== undefined && (coexist || ownEndpoint(profile.openai_base_url))) values.openai_base_url = null;
-    if (profile.model_catalog_json !== undefined && (coexist || profile.model_catalog_json === ctx.modelCatalogPath)) values.model_catalog_json = null;
+    if (profile.model_catalog_json !== undefined && (coexist || gatewayCatalog || profile.model_catalog_json === ctx.modelCatalogPath || ownedApiCatalog(profile.model_catalog_json))) values.model_catalog_json = null;
     if (coexist && profile.forced_login_method === 'api') values.forced_login_method = null;
     if (!coexist && profile.forced_login_method === 'chatgpt') values.forced_login_method = null;
-    if (coexist || isValidContextWindow(contextWindow)) {
+    if (coexist || gatewayCatalog || isValidContextWindow(contextWindow)) {
       if (profile.model_context_window !== undefined) values.model_context_window = null;
       if (profile.model_auto_compact_token_limit !== undefined) values.model_auto_compact_token_limit = null;
     }
@@ -292,7 +304,7 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
   } catch { text = clearManagedHistoryTarget(text); }
   return [{ ...planned(file, text), ...(ctx.permissionMode === 'full-access' ? { permissionScope: { kind: 'codex-execution-v1' as const, ...(typeof current.profile === 'string' ? { profile: current.profile } : {}) } } : {}) }];
 }
-const CODEX_CONTEXT_WARNING = '应用上下文窗口时，自动压缩阈值同步设为其 90%（向下取整，至少 1 Token），修改后需重启客户端。共存模式按模型目录分别设置，并清除旧的全局窗口和阈值覆盖，让切换模型时使用各自的设置。';
+const CODEX_CONTEXT_WARNING = '应用上下文窗口时，自动压缩阈值同步设为其 90%（向下取整，至少 1 Token），修改后需重启客户端。网关与共存模式按模型目录分别设置，并清除旧的全局窗口和阈值覆盖，让切换模型时使用各自的设置。';
 const CODEX_PROVIDER_WARNING = '先保存客户端配置，并为可确认的旧会话供应商补充兼容配置；历史备份与整理随后尝试，客户端运行中或个别历史异常都不影响保存。保存工作后重启客户端加载新配置。';
 function codexProviderWarnings(): string[] {
   return [CODEX_PROVIDER_WARNING];
