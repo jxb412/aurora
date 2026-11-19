@@ -166,6 +166,33 @@ try {
       assert(!f.store.listAgents()['codex-cli']?.connected); noSecrets(result);
     }
   });
+  await check('数据目录经系统别名访问时，失败回滚仍识别规范化模型目录', async () => {
+    for (const kind of ['write', 'state']) {
+      const f = fixture('aliased-rollback-' + kind), originalWrite = fs.writeFileSync;
+      const physical = path.join(f.root, 'physical-data'), alias = path.join(f.root, 'data-alias');
+      fs.mkdirSync(physical);
+      fs.symlinkSync(physical, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const store = new api.AuroraStore(alias);
+      store.saveSettings({ gatewayToken: 'fixture-gateway-secret', gatewayPort: 3425 });
+      const provider = store.saveProvider({ ...f.provider, id: undefined });
+      const deps = { ...f.deps, store, dataDir: alias };
+      const payload = { ...f.payload, providerId: provider.id };
+      const reserved = path.join(alias, 'codex-api-model-catalog.json'), original = '{"models":[],"external":true}';
+      write(reserved, original);
+      if (kind === 'state') store.saveAgentsIfUnchanged = () => { throw new Error('fixture-state-failure'); };
+      else fs.writeFileSync = function(file, ...args) { if (String(file).startsWith(f.config + '.aurora-')) throw Object.assign(new Error('fixture-write-failure'), { code: 'EACCES' }); return originalWrite.call(this, file, ...args); };
+      let result;
+      try {
+        const preview = await api.runAction(deps, 'agent.preview', payload); assert(preview.ok, preview.message);
+        result = await api.runAction(deps, 'agent.connect', { ...payload, revision: preview.revision });
+      } finally { fs.writeFileSync = originalWrite; }
+      assert.equal(result.ok, false); assert.equal(result.recoveryRequired, false);
+      assert.equal(read(f.config), f.configText); assert.equal(read(reserved), original);
+      assert(!fs.existsSync(path.join(physical, 'codex-api-model-catalog-2.json')));
+      assert(!store.listAgents()['codex-cli']?.connected);
+      fs.unlinkSync(alias);
+    }
+  });
   await check('目录原子写 CAS 保留写入期间出现的外部修改', async () => {
     const f = fixture('catalog-cas'), preview = await f.call('agent.preview'); assert(preview.ok);
     const originalWrite = fs.writeFileSync; let raced = false;
