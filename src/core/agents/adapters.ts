@@ -12,6 +12,7 @@ import { readOfficialCodexIdentity, codexCoexistBaseUrl, CODEX_COEXIST_BASE_PATH
 import { codexHistoryBasePath } from '../gateway/historyRoute.js';
 import { nativeDirectParameters } from './directConnection.js';
 import { discoverHistoryProviderIds, detachManagedHistoryProviders, withHistoryProviderAliases, clearManagedHistoryTarget } from './historyProviders.js';
+import { isGatewayCatalogPath, readManagedGatewayModelCatalog } from './catalogStorage.js';
 import { applyPlan, restorePlan, backupPlanFiles, jsonObject, planned, plannedJson, readText, patchToml, patchEnv, redactConfig, digest, type PlannedFile } from './configFiles.js';
 
 export interface ConnectContext {
@@ -28,6 +29,8 @@ export interface ConnectContext {
   permissionMode?: 'preserve' | 'full-access';
   skipOnboarding?: boolean;
   modelCatalogPath?: string;
+  /** Enabled only after native metadata and historical model budgets have been verified. */
+  gatewayModelCatalog?: boolean;
   /** Trusted read-only worker result supplied by the action layer, never copied from renderer payload. */
   desktopDetection?: CodingDesktopDetection;
   /** Trusted main-process preview snapshot, never copied from renderer fields. */
@@ -211,13 +214,11 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
   try { current = parseToml(before.replace(/^\uFEFF/, '')); }
   catch { throw new Error('原 Codex 配置不是有效的 TOML，已停止修改；请在原客户端检查配置。'); }
   const coexist = ctx.authMode === 'coexist';
-  const gatewayCatalog = !coexist && ctx.mode === 'gateway' && !!ctx.modelCatalogPath;
-  if (gatewayCatalog) {
-    const profile = typeof current.profile === 'string' ? current.profiles?.[current.profile] : undefined;
-    if ([current.model_catalog_json, profile?.model_catalog_json].some(value => value !== undefined && value !== ctx.modelCatalogPath)) {
-      throw new Error('当前配置使用外部自定义模型目录，不能自动替换为云桥目录。请先在原客户端移除该目录设置后重新预览，或使用直连模式；原目录和配置未修改。');
-    }
-  }
+  const gatewayCatalog = !coexist && ctx.mode === 'gateway' && ctx.gatewayModelCatalog === true && !!ctx.modelCatalogPath;
+  const ownedApiCatalog = (value: unknown) => typeof value === 'string' && !!ctx.modelCatalogPath
+    && (!!readManagedGatewayModelCatalog(value, path.dirname(ctx.modelCatalogPath))
+      // A known prior connection can detach a missing/edited catalog without owning its current bytes.
+      || !!ctx.previousBackup && isGatewayCatalogPath(value, path.dirname(ctx.modelCatalogPath)));
   if (!coexist) {
     const profile = typeof current.profile === 'string' ? current.profiles?.[current.profile] : undefined;
     if ([current.model_providers?.yunqiao, profile?.model_providers?.yunqiao].some(value => value && typeof value === 'object' && (Object.hasOwn(value, 'auth') || Object.hasOwn(value, 'aws')))) {
@@ -257,7 +258,7 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
       routing.model_catalog_json = ctx.modelCatalogPath!;
       routing.model_context_window = null;
       routing.model_auto_compact_token_limit = null;
-    } else if (current.model_catalog_json === ctx.modelCatalogPath) routing.model_catalog_json = null;
+    } else if (current.model_catalog_json === ctx.modelCatalogPath || ownedApiCatalog(current.model_catalog_json)) routing.model_catalog_json = null;
   }
   const detached = detachManagedHistoryProviders(before);
   let text = patchToml(detached.text, '', routing);
@@ -268,7 +269,7 @@ export function codexPlan(ctx: ConnectContext): PlannedFile[] {
     if (ctx.permissionMode === 'full-access') Object.assign(values, { approval_policy: 'never', sandbox_mode: 'danger-full-access', default_permissions: null });
     // These transport/catalog fields belong at the root; legacy profile schemas reject them.
     if (profile.openai_base_url !== undefined && (coexist || ownEndpoint(profile.openai_base_url))) values.openai_base_url = null;
-    if (profile.model_catalog_json !== undefined && (coexist || profile.model_catalog_json === ctx.modelCatalogPath)) values.model_catalog_json = null;
+    if (profile.model_catalog_json !== undefined && (coexist || gatewayCatalog || profile.model_catalog_json === ctx.modelCatalogPath || ownedApiCatalog(profile.model_catalog_json))) values.model_catalog_json = null;
     if (coexist && profile.forced_login_method === 'api') values.forced_login_method = null;
     if (!coexist && profile.forced_login_method === 'chatgpt') values.forced_login_method = null;
     if (coexist || gatewayCatalog || isValidContextWindow(contextWindow)) {

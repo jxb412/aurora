@@ -512,15 +512,8 @@ def main():
             assert history_target != limits['model_provider'], 'Historical model routing must not alter the default client model menu'
             if not args.expect_history_deferred:
                 history_fixture['assert_provider'](history_target)
-            def assert_native_catalog(configuration, window, compact):
-                assert 'model_context_window' not in configuration and 'model_auto_compact_token_limit' not in configuration
-                catalog_file = Path(configuration['model_catalog_json'])
-                assert catalog_file.resolve() == (data / 'codex-model-catalog.json').resolve()
-                model = next(item for item in json.loads(catalog_file.read_text(encoding='utf-8'))['models']
-                             if item['slug'] == supplier['id'] + '/gpt-6.1-sol')
-                assert (model['context_window'], model['auto_compact_token_limit']) == (window, compact), model
-
-            assert_native_catalog(limits, 272000, 244800)
+            assert limits['model_context_window'] == 272000 and limits['model_auto_compact_token_limit'] == 244800
+            assert 'model_catalog_json' not in limits, 'Missing native metadata must preserve native fallback instead of inventing a catalog'
 
             def assert_legacy_provider_routes(configuration):
                 providers = configuration.get('model_providers', {})
@@ -556,10 +549,10 @@ def main():
                 history_fixture['assert_provider'](history_target)
                 history_fixture['assert_backup'](applied['history']['backupPath'], before_reapply, 0)
             limits = tomllib.loads((clients / '.codex/config.toml').read_text(encoding='utf-8'))
-            assert_native_catalog(limits, 200000, 180000)
+            assert limits['model_context_window'] == 200000 and limits['model_auto_compact_token_limit'] == 180000
             assert_legacy_provider_routes(limits)
             assert (clients / '.codex/auth.json').read_bytes() == original[clients / '.codex/auth.json']
-            checks.append('Apply and reapply store per-model limits 272000/244800 then 200000/180000 in the native catalog, preserve official auth and shared CLI state; history defers without writes for a running client or completes verified raw-file/database backups for an idle client')
+            checks.append('Native configuration apply and reapply write 272000/244800 then 200000/180000 when native metadata is unavailable, preserve official auth and shared CLI state; history defers without writes for a running client or completes verified raw-file/database backups for an idle client')
             before_restore = history_fixture['snapshot']()
             restored = page.evaluate("() => window.aurora.invoke('agent.disconnect', {agentId:'chatgpt-desktop'})")
             if args.expect_history_deferred:

@@ -6,6 +6,7 @@ import type { AgentState } from './store/types.js';
 import { atomicWrite, readText, digest, type PlannedFile } from './agents/configFiles.js';
 import { detectReset } from './agents/adapters.js';
 import { getManagedHistoryTarget } from './agents/historyProviders.js';
+import { isGatewayCatalogPath } from './agents/catalogStorage.js';
 import { createHistoryRepairService } from './historyRepair.js';
 import { historyContext, historyLocation, normalizeHistoryContext, assertClientsStopped, type HistoryContext } from './historyRepairIO.js';
 import { recoverClientHistorySwitches, runClientHistorySwitch, type ClientHistorySwitchSnapshot, type ClientHistoryBackup } from './clientHistorySwitch.js';
@@ -73,7 +74,7 @@ function recoveryOptions(deps: Deps, configurationOnly = false) {
     validateSlice(snapshot.stateBefore); validateSlice(snapshot.stateAfter);
     const key = (file: string) => { const canonical = historyLocation(file); return process.platform === 'win32' ? canonical.toLowerCase() : canonical; };
     const allowed = new Set([key(path.join(ctx.home, 'config.toml')), key(path.join(deps.dataDir, 'codex-model-catalog.json'))]);
-    if (snapshot.files.some(file => !allowed.has(key(file.path)))) throw new Error('配置恢复路径无法校验');
+    if (snapshot.files.some(file => !allowed.has(key(file.path)) && !isGatewayCatalogPath(file.path, deps.dataDir))) throw new Error('配置恢复路径无法校验');
     const fresh = deps.store.readAgentSnapshot(), current = slice(fresh.states);
     for (const id of CODEX_STATE_IDS) {
       if (identity(current[id]) !== identity(snapshot.stateBefore[id]) && identity(current[id]) !== identity(snapshot.stateAfter[id]))

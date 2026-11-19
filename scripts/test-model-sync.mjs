@@ -62,6 +62,24 @@ try {
     { id: 'unknown-reasoning', reasoning: 'true' },
   ] });
   const original = store.saveProvider.bind(store);
+  await check('Image capability metadata preserves explicit and concurrent local choices', p => store.saveProvider({ ...p,
+    models: [{ id: 'existing', capabilities: { tools: true, vision: false } }, { id: 'remove-me' }] }), (result, current) => {
+    assert.equal(result.ok, true);
+    const models = Object.fromEntries(current.models.map(model => [model.id, model]));
+    assert.deepEqual(models.existing.capabilities, { tools: true, vision: false });
+    assert.equal(models['remove-me'].capabilities.vision, true);
+    assert.equal(models['modality-image'].capabilities.vision, true);
+    assert.equal(models['modality-text'].capabilities.vision, false);
+    assert.equal(models['explicit-off'].capabilities.vision, false);
+    assert.equal(models['nested-image'].capabilities.vision, true);
+    for (const id of ['unknown', 'invalid', 'empty']) assert.equal(models[id].capabilities, undefined);
+  }, { data: [
+    { id: 'existing', vision: true }, { id: 'remove-me', capabilities: { vision: true } },
+    { id: 'modality-image', input_modalities: ['text', 'image'] }, { id: 'modality-text', input_modalities: ['text'] },
+    { id: 'explicit-off', capabilities: { vision: false }, input_modalities: ['text', 'image'] },
+    { id: 'nested-image', architecture: { input_modalities: ['text', 'image'] } },
+    { id: 'unknown' }, { id: 'invalid', vision: 'true', input_modalities: [null] }, { id: 'empty', input_modalities: [] },
+  ] });
   try {
     await check('Local persistence errors remain explicit without retrying another endpoint', () => { store.saveProvider = () => { throw new Error('fixture full disk'); }; }, (result, current) => {
       assert.equal(result.ok, false); assert.match(result.message, /本地保存失败/); assert.equal(current.models.length, 2);

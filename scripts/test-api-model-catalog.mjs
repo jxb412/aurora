@@ -12,6 +12,12 @@ const priorHome = process.env.AURORA_CLIENT_HOME;
 const write = (file, content) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, content); };
 const read = file => fs.readFileSync(file, 'utf8');
 const json = file => JSON.parse(read(file));
+const native = (slug, overrides = {}) => ({ slug, display_name: slug, base_instructions: `Native ${slug} coding instructions.`,
+  model_messages: { instructions_template: 'Native {personality} coding instructions.', instructions_variables: { personality: { default: 'default' } } },
+  shell_type: 'shell_command', visibility: 'list', supported_in_api: true, priority: 1, support_verbosity: false,
+  truncation_policy: { mode: 'tokens', limit: 10000 }, experimental_supported_tools: [],
+  supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh'].map(effort => ({ effort, description: effort })),
+  default_reasoning_level: 'medium', input_modalities: ['text'], context_window: 272000, supports_parallel_tool_calls: true, ...overrides });
 let passed = 0;
 const check = async (name, run) => { await run(); passed++; console.log('PASS', name); };
 try {
@@ -21,11 +27,14 @@ try {
     "export * from './src/core/agents/modelCatalog.ts';", "export * from './src/core/extensions/models.ts';",
   ].join('\n'), resolveDir: workspace, loader: 'ts' }, outfile: bundle, bundle: true, platform: 'node', format: 'cjs', logLevel: 'silent' });
   const api = createRequire(import.meta.url)(bundle);
-  function fixture(name, configText = 'model_reasoning_effort = "xhigh"\nmodel_context_window = 123\nmodel_auto_compact_token_limit = 100\n') {
+  function fixture(name, configText = 'model_reasoning_effort = "xhigh"\nmodel_context_window = 123\nmodel_auto_compact_token_limit = 100\n', options = {}) {
     const root = path.join(scratch, name), client = path.join(root, 'client');
     process.env.AURORA_CLIENT_HOME = client;
     const config = path.join(client, '.codex', 'config.toml');
     write(config, configText);
+    const cache = path.join(client, '.codex', 'models_cache.json');
+    if (!options.noMetadata) write(cache, JSON.stringify({ models: ['gpt-5.4', 'custom-text', 'custom-vision', 'no-thinking', 'new-text', 'direct-only-new'].map(id =>
+      native(id, id === 'custom-text' ? { default_reasoning_level: null, supported_reasoning_levels: [] } : {})) }));
     const store = new api.AuroraStore(path.join(root, 'store'));
     store.saveSettings({ gatewayToken: 'fixture-gateway-secret', gatewayPort: 3425 });
     const provider = store.saveProvider({ name: '当前供应商', enabled: true, format: 'openai-responses', baseUrl: 'https://fixture.invalid/v1',
@@ -34,20 +43,23 @@ try {
         { id: 'no-thinking', capabilities: { thinking: false } }, { id: 'gpt-image-1' }, { id: 'text-embedding-3-large' }, { id: 'whisper-1' }] });
     store.saveProvider({ ...provider, id: undefined, name: '其他供应商', models: [{ id: 'not-current' }] });
     const deps = { store, dataDir: store.dir, gatewayUrl: () => 'http://127.0.0.1:3425', gatewayStatus: () => ({ running: true }),
-      historyContext: { home: path.dirname(config), sqliteHome: path.dirname(config), blockingProcesses: async () => ['fixture-client-running'] } };
+      historyContext: { home: path.dirname(config), sqliteHome: path.dirname(config), blockingProcesses: async () => options.busy ? ['fixture-client-running'] : [] } };
     const payload = { agentId: 'codex-cli', providerId: provider.id, model: 'gpt-5.4', authMode: 'api', mode: 'gateway' };
     const call = (action, patch = {}) => api.runAction(deps, action, { ...payload, ...patch });
-    const catalog = path.join(store.dir, 'codex-model-catalog.json');
+    const catalogDefault = path.join(store.dir, 'codex-api-model-catalog.json');
     const connect = async patch => { const preview = await call('agent.preview', patch); assert(preview.ok, preview.message); return call('agent.connect', { ...patch, revision: preview.revision }); };
-    return { root, config, configText, catalog, store, provider, deps, payload, call, connect };
+    return { root, config, configText, cache, catalogDefault, get catalog() {
+      const current = parse(read(config)).model_catalog_json;
+      return typeof current === 'string' && /^codex-api-model-catalog(?:-\d+)?\.json$/.test(path.basename(current)) ? current : catalogDefault;
+    }, store, provider, deps, payload, call, connect };
   }
   const noSecrets = value => { for (const secret of ['fixture-gateway-secret', 'fixture-provider-secret']) assert(!JSON.stringify(value).includes(secret)); };
   const guardOfficialFiles = async run => {
     const originalRead = fs.readFileSync, originalStat = fs.lstatSync; let attempts = 0;
-    const guard = file => { if (typeof file === 'string' && /(?:auth\.json|models_cache\.json)$/.test(file)) { attempts++; throw new Error('API 模式不得读取官方身份或缓存'); } };
+    const guard = file => { if (typeof file === 'string' && /(?:^|[/\\])auth\.json$/.test(file)) { attempts++; throw new Error('API 模式不得读取官方身份'); } };
     fs.readFileSync = function(file, ...args) { guard(file); return originalRead.call(this, file, ...args); };
     fs.lstatSync = function(file, ...args) { guard(file); return originalStat.call(this, file, ...args); };
-    try { const result = await run(); assert.equal(attempts, 0, 'API 模式不得尝试读取官方身份或缓存'); return result; }
+    try { const result = await run(); assert.equal(attempts, 0, 'API 模式不得尝试读取官方身份'); return result; }
     finally { fs.readFileSync = originalRead; fs.lstatSync = originalStat; }
   };
   await check('API 网关无需官方身份，挂载当前供应商全部文本模型并保留 xhigh', async () => {
@@ -65,24 +77,72 @@ try {
       assert.equal(catalog.models[0].auto_compact_token_limit, 244800);
       assert.equal(catalog.models[1].default_reasoning_level, null); assert.deepEqual(catalog.models[1].supported_reasoning_levels, []);
       assert.deepEqual(catalog.models[2].input_modalities, ['text', 'image']);
-      for (const model of catalog.models) { assert.equal(model.supports_parallel_tool_calls, false); assert(!model.supported_reasoning_levels.some(x => x.effort === 'none')); }
+      for (const model of catalog.models) { assert.equal(model.supports_parallel_tool_calls, true); assert(model.base_instructions.startsWith('Native ')); assert(model.model_messages.instructions_template); }
+      assert.equal(catalog.models[3].default_reasoning_level, null); assert.deepEqual(catalog.models[3].supported_reasoning_levels, []);
+      assert.equal(catalog.yunqiao.storageVersion, 1); assert.match(catalog.yunqiao.contentSha256, /^[a-f0-9]{64}$/);
       const desktop = api.desktopModelCatalog(f.store); assert.deepEqual(desktop.models, catalog.models.map(m => m.slug));
       assert(desktop.modelMetadata[`${f.provider.id}/gpt-5.4`].supportedReasoningEfforts.some(x => x.reasoningEffort === 'xhigh')); noSecrets(desktop);
       const disconnected = await f.call('agent.disconnect'); assert(disconnected.ok, disconnected.message); assert.equal(read(f.config), f.configText);
     });
   });
-  await check('新模型仅凭显式能力启用 reasoning，禁用声明优先于模型名', async () => {
-    const f = fixture('explicit-reasoning');
-    const models = [
-      { id: 'gpt-6.2-sol' }, { id: 'gpt-6.2-sol-enabled', capabilities: { thinking: true } },
-      { id: 'custom-effort', thinkingField: 'reasoning_effort' },
-      { id: 'gpt-5.4-disabled', capabilities: { thinking: false } },
-      { id: 'gpt-5.4-none', thinkingField: 'none' },
-    ];
-    const catalog = api.buildGatewayModelCatalog({ ...f.provider, models });
-    assert.deepEqual(catalog.models.map(m => m.supported_reasoning_levels.map(level => level.effort)),
-      [[], ['low', 'medium', 'high'], ['low', 'medium', 'high'], [], []]);
-    assert.deepEqual(catalog.models.map(m => m.default_reasoning_level), [null, 'medium', 'medium', null, null]);
+  await check('缺少原生资料或客户端运行中时继续保存配置与 90% 压缩阈值', async () => {
+    for (const options of [{ noMetadata: true }, { busy: true }]) {
+      const f = fixture('fallback-' + Object.keys(options)[0], undefined, options);
+      await guardOfficialFiles(async () => {
+        const result = await f.connect(); assert(result.ok, result.message);
+        const config = parse(read(f.config));
+        assert.equal(config.model_catalog_json, undefined); assert(!fs.existsSync(f.catalog));
+        assert.equal(config.model_context_window, 272000); assert.equal(config.model_auto_compact_token_limit, 244800);
+        assert.equal(config.model_provider, 'yunqiao'); assert.equal(config.model, `${f.provider.id}/gpt-5.4`);
+        if (options.busy) { assert.equal(result.history.status, 'deferred'); assert.equal(result.history.code, 'CLIENT_HISTORY_BUSY'); }
+        const restored = await f.call('agent.disconnect'); assert(restored.ok, restored.message); assert.equal(read(f.config), f.configText);
+      });
+    }
+  });
+  await check('未知历史模型仍保留所选模型预算，配置可以保存', async () => {
+    const f = fixture('history-fallback');
+    const file = path.join(path.dirname(f.config), 'sessions', 'unindexed.jsonl');
+    const original = JSON.stringify({ type: 'turn_context', payload: { model: 'retired-model' } }) + '\n';
+    write(file, original);
+    const result = await f.connect(); assert(result.ok, result.message);
+    const config = parse(read(f.config)); assert.equal(config.model_catalog_json, undefined);
+    assert.equal(config.model_context_window, 272000); assert.equal(config.model_auto_compact_token_limit, 244800);
+    assert.equal(read(file), original);
+  });
+  await check('预览后客户端退出不会阻止已预览的兼容配置保存', async () => {
+    const f = fixture('busy-preview-idle-connect', undefined, { busy: true });
+    const preview = await f.call('agent.preview'); assert(preview.ok, preview.message);
+    f.deps.historyContext.blockingProcesses = async () => [];
+    const result = await f.call('agent.connect', { revision: preview.revision });
+    assert(result.ok, result.message);
+    assert.equal(parse(read(f.config)).model_context_window, 272000);
+    assert.equal(parse(read(f.config)).model_catalog_json, undefined);
+  });
+  await check('预览后客户端启动仍可保存，历史新增时仅降级目录优化', async () => {
+    for (const changedHistory of [false, true]) {
+      const f = fixture('idle-preview-running-' + changedHistory);
+      const preview = await f.call('agent.preview'); assert(preview.ok, preview.message);
+      f.deps.historyContext.blockingProcesses = async () => ['fixture-running-after-preview'];
+      if (changedHistory) write(path.join(path.dirname(f.config), 'sessions', 'new-unindexed.jsonl'),
+        JSON.stringify({ type: 'turn_context', payload: { model: 'new-retired-model' } }) + '\n');
+      const result = await f.call('agent.connect', { revision: preview.revision }); assert(result.ok, result.message);
+      const config = parse(read(f.config));
+      if (changedHistory) { assert.equal(config.model_context_window, 272000); assert.equal(config.model_auto_compact_token_limit, 244800); assert.equal(config.model_catalog_json, undefined); }
+      else assert.equal(config.model_catalog_json, f.catalog);
+      assert.equal(result.history.code, 'CLIENT_HISTORY_BUSY');
+    }
+  });
+  await check('目录辅助降级不会绕过配置、权限或供应商变更校验', async () => {
+    for (const kind of ['config', 'permission', 'provider', 'catalog']) {
+      const f = fixture('downgrade-validation-' + kind), preview = await f.call('agent.preview'); assert(preview.ok);
+      write(path.join(path.dirname(f.config), 'sessions', 'unindexed.jsonl'), JSON.stringify({ type: 'turn_context', payload: { model: 'retired-model' } }) + '\n');
+      if (kind === 'config') write(f.config, f.configText + '# outside edit\n');
+      if (kind === 'provider') f.store.saveProvider({ id: f.provider.id, name: 'changed outside preview' });
+      if (kind === 'catalog') write(f.catalogDefault, '{"outside":true}');
+      const before = read(f.config);
+      const result = await f.call('agent.connect', { revision: preview.revision, ...(kind === 'permission' ? { permissionMode: 'full-access' } : {}) });
+      assert.equal(result.ok, false, kind); assert.equal(read(f.config), before); assert(!f.store.listAgents()['codex-cli']?.connected);
+    }
   });
   await check('目录内容或供应商列表在预览后变化时拒绝写入', async () => {
     for (const kind of ['catalog', 'models']) {
@@ -102,6 +162,7 @@ try {
       else fs.writeFileSync = function(file, ...args) { if (String(file).startsWith(f.config + '.aurora-')) throw Object.assign(new Error('fixture-write-failure'), { code: 'EACCES' }); return originalWrite.call(this, file, ...args); };
       let result; try { result = await f.connect(); } finally { fs.writeFileSync = originalWrite; }
       assert.equal(result.ok, false); assert.equal(read(f.config), f.configText); assert.equal(read(f.catalog), before);
+      assert(!fs.existsSync(path.join(f.store.dir, 'codex-api-model-catalog-2.json')));
       assert(!f.store.listAgents()['codex-cli']?.connected); noSecrets(result);
     }
   });
@@ -117,12 +178,23 @@ try {
     assert(raced); assert.equal(result.ok, false); assert.equal(read(f.config), f.configText);
     assert.equal(read(f.catalog), '{"external":"保留并发修改"}'); assert(!f.store.listAgents()['codex-cli']?.connected);
   });
-  await check('外部根目录或 profile 目录明确报冲突，直连仍保留目录', async () => {
-    for (const source of ['model_catalog_json = "C:/fixture-external.json"\n', 'profile = "work"\n[profiles.work]\nmodel_catalog_json = "C:/fixture-profile.json"\n']) {
-      const f = fixture('external-' + passed + source.length, source), preview = await f.call('agent.preview');
-      assert.equal(preview.ok, false); assert.match(preview.message, /外部自定义模型目录/); assert.equal(read(f.config), source); assert(!fs.existsSync(f.catalog));
-      const direct = await f.connect({ mode: 'direct' }); assert(direct.ok, direct.message); assert(!fs.existsSync(f.catalog));
-      const parsed = parse(read(f.config)); assert.equal(parsed.profiles?.work?.model_catalog_json ?? parsed.model_catalog_json, parse(source).profiles?.work?.model_catalog_json ?? parse(source).model_catalog_json);
+  await check('既有根目录或 profile 目录成功切换且恢复后原文件不动', async () => {
+    for (const kind of ['root', 'profile', 'reserved', 'legacy-shared']) {
+      const f = fixture('external-' + kind);
+      const originalFile = kind === 'reserved' ? f.catalogDefault : kind === 'legacy-shared' ? path.join(f.store.dir, 'codex-model-catalog.json') : path.join(f.root, 'custom-models.json');
+      const original = '{"models":[{"slug":"original-model"}],"custom":true}\n';
+      write(originalFile, original);
+      const source = (kind === 'profile' ? 'profile = "work"\n[profiles.work]\n' : '') + `model_catalog_json = ${JSON.stringify(originalFile)}\n`;
+      write(f.config, source);
+      const preview = await f.call('agent.preview'); assert(preview.ok, preview.message); assert.equal(read(originalFile), original);
+      const result = await f.call('agent.connect', { revision: preview.revision }); assert(result.ok, result.message);
+      assert.notEqual(parse(read(f.config)).model_catalog_json, originalFile); assert.equal(read(originalFile), original);
+      const restored = await f.call('agent.disconnect'); assert(restored.ok, restored.message);
+      assert.equal(read(f.config), source); assert.equal(read(originalFile), original);
+      const direct = await f.connect({ mode: 'direct' }); assert(direct.ok, direct.message);
+      const parsed = parse(read(f.config));
+      if (kind !== 'legacy-shared') assert.equal(parsed.profiles?.work?.model_catalog_json ?? parsed.model_catalog_json, originalFile);
+      assert.equal(read(originalFile), original);
     }
   });
   await check('刷新反映模型新增删除，且不会覆盖外部目录或直连', async () => {
@@ -131,11 +203,15 @@ try {
     await guardOfficialFiles(() => api.refreshGatewayModelCatalog(f.store));
     assert.deepEqual(json(f.catalog).models.map(m => m.slug), [`${f.provider.id}/gpt-5.4`, `${f.provider.id}/new-text`]);
     assert.equal(json(f.catalog).models[0].context_window, 128000);
-    const direct = await f.connect({ mode: 'direct' }); assert(direct.ok, direct.message); const prior = read(f.catalog);
+    const priorFile = f.catalog, prior = read(priorFile);
+    const direct = await f.connect({ mode: 'direct' }); assert(direct.ok, direct.message); assert.equal(parse(read(f.config)).model_catalog_json, undefined);
     f.store.saveProvider({ id: f.provider.id, models: [{ id: 'gpt-5.4' }, { id: 'direct-only-new' }] });
-    api.refreshGatewayModelCatalog(f.store); assert.equal(read(f.catalog), prior);
+    api.refreshGatewayModelCatalog(f.store); assert.equal(read(priorFile), prior);
     const again = await f.connect(); assert(again.ok, again.message);
-    write(f.catalog, '{"models":[],"external":true}'); api.refreshGatewayModelCatalog(f.store); assert.equal(read(f.catalog), '{"models":[],"external":true}');
+    const externalFile = f.catalog, external = '{"models":[],"external":true}';
+    write(externalFile, external); api.refreshGatewayModelCatalog(f.store); assert.equal(read(externalFile), external);
+    const recovered = await f.connect(); assert(recovered.ok, recovered.message);
+    assert.notEqual(f.catalog, externalFile); assert.equal(read(externalFile), external);
   });
   await check('刷新清理已停用或删除供应商，不泄露其他供应商模型', async () => {
     for (const action of ['disable', 'delete']) {
@@ -143,6 +219,58 @@ try {
       if (action === 'disable') f.store.saveProvider({ id: f.provider.id, enabled: false });
       else f.store.providers.write(f.store.listProviders().filter(provider => provider.id !== f.provider.id));
       api.refreshGatewayModelCatalog(f.store); assert.deepEqual(json(f.catalog).models, []);
+    }
+  });
+  await check('原生目录、直连与官方共存切换后恢复首次配置，目录和身份互不覆盖', async () => {
+    const f = fixture('native-direct-coexist');
+    const first = await f.connect(); assert(first.ok, first.message);
+    const apiFile = f.catalog, apiText = read(apiFile);
+    const direct = await f.connect({ mode: 'direct' }); assert(direct.ok, direct.message);
+    assert.equal(parse(read(f.config)).model_catalog_json, undefined); assert.equal(read(apiFile), apiText);
+    const token = `${Buffer.from('{"alg":"fixture"}').toString('base64url')}.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600,
+      'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-account' } })).toString('base64url')}.fixture`;
+    const authFile = path.join(path.dirname(f.config), 'auth.json');
+    const auth = JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: token, refresh_token: 'fixture-refresh', account_id: 'fixture-account' } });
+    write(authFile, auth);
+    const cached = json(f.cache); write(f.cache, JSON.stringify({ ...cached, models: cached.models.map(model => ({ ...model, slug: 'official/' + model.slug })) }));
+    const coexist = await f.connect({ authMode: 'coexist' }); assert(coexist.ok, coexist.message);
+    const coexistFile = parse(read(f.config)).model_catalog_json;
+    assert.equal(coexistFile, path.join(f.store.dir, 'codex-model-catalog.json')); assert.notEqual(coexistFile, apiFile);
+    assert.equal(read(apiFile), apiText); assert.equal(read(authFile), auth);
+    const coexistText = read(coexistFile);
+    const again = await f.connect(); assert(again.ok, again.message); assert.notEqual(f.catalog, coexistFile);
+    assert.equal(read(coexistFile), coexistText); assert.equal(read(authFile), auth);
+    const restored = await f.call('agent.disconnect'); assert(restored.ok, restored.message);
+    assert.equal(read(f.config), f.configText); assert.equal(read(apiFile), apiText); assert.equal(read(coexistFile), coexistText); assert.equal(read(authFile), auth);
+  });
+  await check('原生资料消失后刷新保留已用目录，重新保存降级且恢复原配置', async () => {
+    const f = fixture('metadata-disappears');
+    const connected = await f.connect(); assert(connected.ok, connected.message);
+    const catalogFile = f.catalog, originalCatalog = read(catalogFile);
+    fs.unlinkSync(f.cache);
+    assert.throws(() => api.refreshGatewayModelCatalog(f.store), /原生模型资料/);
+    assert.equal(read(catalogFile), originalCatalog);
+    const fallback = await f.connect(); assert(fallback.ok, fallback.message);
+    const config = parse(read(f.config)); assert.equal(config.model_catalog_json, undefined);
+    assert.equal(config.model_context_window, 272000); assert.equal(config.model_auto_compact_token_limit, 244800);
+    assert.equal(read(catalogFile), originalCatalog);
+    const restored = await f.call('agent.disconnect'); assert(restored.ok, restored.message); assert.equal(read(f.config), f.configText);
+  });
+  await check('已连接目录损坏或缺失时兼容配置解除引用，保留外部目录内容', async () => {
+    for (const kind of ['missing', 'invalid-json', 'external-edit', 'busy']) {
+      const f = fixture('broken-mounted-' + kind), connected = await f.connect(); assert(connected.ok, connected.message);
+      const catalogFile = f.catalog;
+      if (kind === 'missing') fs.unlinkSync(catalogFile);
+      else write(catalogFile, kind === 'external-edit' ? '{"models":[],"external":"preserve"}' : '{broken catalog');
+      const preserved = fs.existsSync(catalogFile) ? read(catalogFile) : undefined;
+      if (kind === 'busy') f.deps.historyContext.blockingProcesses = async () => ['fixture-client-running'];
+      else fs.unlinkSync(f.cache);
+      const fallback = await f.connect(); assert(fallback.ok, fallback.message);
+      const config = parse(read(f.config)); assert.equal(config.model_catalog_json, undefined);
+      assert.equal(config.model_context_window, 272000); assert.equal(config.model_auto_compact_token_limit, 244800);
+      assert.equal(fs.existsSync(catalogFile) ? read(catalogFile) : undefined, preserved);
+      const restored = await f.call('agent.disconnect'); assert(restored.ok, restored.message); assert.equal(read(f.config), f.configText);
+      assert.equal(fs.existsSync(catalogFile) ? read(catalogFile) : undefined, preserved);
     }
   });
   await check('profile 网关目录仅写根级且清除旧的全局窗口覆盖', async () => {
@@ -154,5 +282,5 @@ try {
   console.log(`API 原生模型目录：${passed} 项隔离检查通过`);
 } finally {
   if (priorHome === undefined) delete process.env.AURORA_CLIENT_HOME; else process.env.AURORA_CLIENT_HOME = priorHome;
-  assert.equal(path.dirname(scratch), os.tmpdir()); fs.rmSync(scratch, { recursive: true, force: true });
+  assert.equal(path.dirname(scratch), path.resolve(os.tmpdir())); fs.rmSync(scratch, { recursive: true, force: true });
 }

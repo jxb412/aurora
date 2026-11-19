@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from 'smol-toml';
 import type { AuroraStore } from '../store/index.js';
@@ -6,6 +5,9 @@ import type { Provider, ProviderModel } from '../store/types.js';
 import { codexConfigPath } from '../codex.js';
 import { applyContextDefaults, defaultAutoCompactTokenLimit, isValidContextWindow } from '../modelContext.js';
 import { atomicWrite, readText } from './configFiles.js';
+import { nativeModelId, readNativeModelMetadata, validatedNativeModel } from './nativeModelMetadata.js';
+import { readManagedGatewayModelCatalog, serializeGatewayModelCatalog } from './catalogStorage.js';
+import { readHistoryModelCoverage } from './historyModelCoverage.js';
 
 export const CODEX_MODEL_CATALOG_FILE = 'codex-model-catalog.json';
 const OWNER = 'yunqiao-api-gateway-v1';
@@ -30,38 +32,42 @@ export function gatewayProviderAvailable(provider: Provider): boolean {
   } catch { return false; }
 }
 
-function reasoningLevels(model: ProviderModel): string[] {
-  if (model.capabilities?.thinking === false || model.thinkingField === 'none') return [];
-  const id = model.id.toLowerCase().replace(/^openai\//, '');
-  if (/^gpt-5(?:\.[2-9]\d*|\.[1-9]\d{1,})(?:[-.]|$)/.test(id) || /^gpt-5\.1-codex-max(?:[-.]|$)/.test(id)) return ['low', 'medium', 'high', 'xhigh'];
-  if (/^gpt-5(?:[-.]|$)/.test(id)) return ['minimal', 'low', 'medium', 'high'];
-  if (/^o[134](?:[-.]|$)/.test(id) || model.capabilities?.thinking || model.thinkingField === 'reasoning_effort') return ['low', 'medium', 'high'];
-  return [];
-}
-
-/** 仅依据供应商元数据生成，不读取官方身份、模型缓存或会话。 */
-export function buildGatewayModelCatalog(provider: Provider): GatewayModelCatalog {
+/** Use exact local native templates; missing metadata falls back to ordinary API configuration. */
+export function buildGatewayModelCatalog(provider: Provider, templates: readonly Record<string, any>[] = readNativeModelMetadata()): GatewayModelCatalog | undefined {
+  const native = new Map<string, Record<string, any> | undefined>();
+  for (const raw of templates) {
+    const model = validatedNativeModel(raw);
+    if (!model) continue;
+    const id = nativeModelId(model.slug);
+    // Ambiguous cache entries cannot authorize replacing the client's own model metadata.
+    native.set(id, native.has(id) ? undefined : model);
+  }
   const seen = new Set<string>();
+  let incomplete = false;
   const models = gatewayProviderAvailable(provider) ? provider.models.filter(isCodexTextModel).flatMap(model => {
     const slug = `${provider.id}/${model.id}`;
     if (seen.has(slug)) return [];
     seen.add(slug);
+    const template = native.get(nativeModelId(model.id));
+    if (!template) { incomplete = true; return []; }
     const context = applyContextDefaults(model).contextWindow;
-    const window = isValidContextWindow(context) ? context : 32768;
-    const levels = reasoningLevels(model);
-    return [{ slug, display_name: model.displayName || model.id, description: `${provider.name} / ${model.id}`,
-      base_instructions: '', model_messages: null, priority: seen.size, visibility: 'list', supported_in_api: true,
-      default_reasoning_level: levels.length ? 'medium' : null,
-      supported_reasoning_levels: levels.map(effort => ({ effort, description: effort })),
+    const window = isValidContextWindow(context) ? context : template.context_window;
+    if (!isValidContextWindow(window)) { incomplete = true; return []; }
+    const thinkingDisabled = model.capabilities?.thinking === false || model.thinkingField === 'none';
+    return [{ ...structuredClone(template), slug, display_name: model.displayName || model.id, description: `${provider.name} / ${model.id}`,
+      priority: seen.size, visibility: 'list', supported_in_api: true,
+      ...(thinkingDisabled ? { default_reasoning_level: null, supported_reasoning_levels: [] } : {}),
       additional_speed_tiers: [], service_tiers: [], availability_nux: null, upgrade: null,
-      supports_parallel_tool_calls: false, supports_reasoning_summaries: false, support_verbosity: false,
-      experimental_supported_tools: [], supports_search_tool: false, supports_tool_search: false,
-      input_modalities: model.capabilities?.vision === true ? ['text', 'image'] : ['text'],
-      context_window: window, max_context_window: isValidContextWindow(context) ? context : null,
+      ...(model.capabilities?.vision === true ? { input_modalities: ['text', 'image'] }
+        : model.capabilities?.vision === false ? { input_modalities: ['text'] } : {}),
+      context_window: window, max_context_window: window,
       effective_context_window_percent: 95, auto_compact_token_limit: defaultAutoCompactTokenLimit(window),
-      prefer_websockets: false, shell_type: 'shell_command', truncation_policy: { mode: 'tokens', limit: 10000 } }];
+      prefer_websockets: false }];
   }) : [];
-  return { models, yunqiao: { kind: OWNER, providerId: provider.id } };
+  if (incomplete) return undefined;
+  const result: GatewayModelCatalog = { models, yunqiao: { kind: OWNER, providerId: provider.id } };
+  // planned()/atomicWrite() read at most 4 MiB. Leave room for the ownership envelope.
+  return Buffer.byteLength(JSON.stringify(result, null, 2), 'utf8') < 4 * 1024 * 1024 - 8192 ? result : undefined;
 }
 
 /** 只刷新已挂载且带所有权标记的 API 网关目录；外部目录和直连配置不动。 */
@@ -70,23 +76,27 @@ export function refreshGatewayModelCatalog(store: AuroraStore): void {
   if (!configBefore) return;
   const root: any = parse(configBefore.replace(/^\uFEFF/, ''));
   const profile = typeof root.profile === 'string' ? root.profiles?.[root.profile] : undefined;
-  const file = path.join(store.dir, CODEX_MODEL_CATALOG_FILE);
-  if ((profile?.model_provider ?? root.model_provider) !== 'yunqiao'
-    || (profile?.model_catalog_json ?? root.model_catalog_json) !== file) return;
+  const file = profile?.model_catalog_json ?? root.model_catalog_json;
+  if ((profile?.model_provider ?? root.model_provider) !== 'yunqiao') return;
+  const managed = readManagedGatewayModelCatalog(file, store.dir);
+  if (!managed) return;
   const states = store.listAgents();
   const agent = [states['chatgpt-desktop'], states['codex-desktop'], states['codex-cli']]
     .find(value => value?.connected && value.mode === 'gateway' && value.authMode !== 'coexist');
   if (!agent?.providerId) return;
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 12 * 1024 * 1024) throw new Error('模型目录无法安全读取');
-  const before = readText(file), previous = JSON.parse(before);
-  if (previous?.yunqiao?.kind !== OWNER || previous.yunqiao.providerId !== agent.providerId) return;
+  const { text: before, catalog: previous } = managed;
+  if (previous.yunqiao.providerId !== agent.providerId) return;
   const providers = store.listProviders(), providerRevision = store.providers.revision(providers);
   const provider = providers.find(value => value.id === agent.providerId);
-  const catalog: GatewayModelCatalog = provider ? buildGatewayModelCatalog(provider)
+  const catalog: GatewayModelCatalog | undefined = provider ? buildGatewayModelCatalog(provider)
     : { models: [], yunqiao: { kind: OWNER, providerId: agent.providerId } };
-  const after = JSON.stringify(catalog, null, 2);
+  if (!catalog) throw new Error('原生模型资料暂不完整，请重新应用客户端配置；上次目录保持不变');
+  const after = serializeGatewayModelCatalog(catalog);
   if (after === before) return;
+  const home = path.dirname(configFile), sqliteHome = process.env.AURORA_CLIENT_HOME ? home : process.env.CODEX_SQLITE_HOME || home;
+  const selected = typeof agent.model === 'string' ? `${agent.providerId}/${agent.model}` : '';
+  if (catalog.models.length && !readHistoryModelCoverage(configBefore, home, sqliteHome, catalog, selected).safe)
+    throw new Error('历史模型预算需要兼容设置，请重新应用客户端配置；上次目录保持不变');
   if (readText(configFile) !== configBefore || store.providers.revision(providers) !== providerRevision) throw new Error('配置或供应商目录已变化，请重新刷新');
   atomicWrite(file, after, { existed: true, content: before });
 }
