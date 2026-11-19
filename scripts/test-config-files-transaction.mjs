@@ -49,6 +49,28 @@ try {
   await build({ entryPoints: [path.join(workspace, 'src/core/agents/configFiles.ts')], outfile: bundle, bundle: true, platform: 'node', format: 'cjs', logLevel: 'silent' });
   api = createRequire(import.meta.url)(bundle);
 
+  check('Codex desktop pipe rotation is tolerated, but every other byte remains protected', () => {
+    const root = path.join(scratch, `runtime-${++sequence}`), file = path.join(root, 'config.toml');
+    const first = 'model = "fixture-model"\n[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = \'\\\\.\\pipe\\codex-computer-use-11111111-1111-4111-8111-111111111111\'\nOTHER = "keep"\n';
+    write(file, first);
+    const installed = first.replace('fixture-model', 'selected-model');
+    const backup = api.applyPlan('codex-cli', [api.planned(file, installed)]);
+    const rotated = installed.replace('11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222');
+    write(file, rotated);
+    assert(api.inspectAppliedPlan('codex-cli', backup, [file]).unchanged);
+    const next = api.applyPlan('codex-cli', [api.planned(file, rotated)], backup);
+    assert.equal(read(file), rotated);
+    assert.equal(JSON.parse(read(next)).files[0].backup, JSON.parse(read(backup)).files[0].backup);
+    for (const changed of [rotated.replace('selected-model', 'external-model'), rotated.replace('OTHER = "keep"', 'OTHER = "changed"'), rotated + '# unrelated edit\n', rotated.replace('codex-computer-use-', 'untrusted-pipe-')]) {
+      write(file, changed);
+      assert(!api.inspectAppliedPlan('codex-cli', next, [file]).unchanged);
+      assert.throws(() => api.applyPlan('codex-cli', [api.planned(file, rotated)], next));
+      assert.equal(read(file), changed);
+    }
+    assert.equal(api.codexRuntimeHash(file, 'not valid = ['), undefined);
+    assert.equal(api.codexRuntimeHash(path.join(root, 'other.toml'), rotated), undefined);
+  });
+
   check('Apply failure restores earlier existing/new files and retains every original backup', () => {
     const f = fixture(3, [1]);
     const error = fault(() => api.applyPlan('fixture-client', f.plan()), (_from, to, rename) => { if (to === f.paths[2]) throw Error(injectedSecret); return rename(); });

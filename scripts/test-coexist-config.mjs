@@ -101,7 +101,7 @@ try {
 
   const exitPreview = await api.runAction(deps, 'agent.preview', { agentId: 'codex-cli', providerId: supplier.id, model: 'relay-model', authMode: 'api' });
   const exited = await api.runAction(deps, 'agent.connect', { agentId: 'codex-cli', providerId: supplier.id, model: 'relay-model', authMode: 'api', revision: exitPreview.revision });
-  check('leaving coexistence removes only coexist routing and keeps the API provider', () => { assert(exited.ok, exited.message); const parsed = parseToml(configFile); assert.equal(parsed.model_provider, 'yunqiao'); assert.equal(parsed.model, `${supplier.id}/relay-model`); assert.equal(parsed.profiles['work.v2'].model_provider, 'yunqiao'); assert.equal(parsed.profiles['work.v2'].permissions[0], 'read'); assert.equal(parsed.openai_base_url, undefined); assert.equal(parsed.model_catalog_json, undefined); assert.equal(parsed.profiles['work.v2'].openai_base_url, undefined); assert.equal(parsed.profiles['work.v2'].model_catalog_json, undefined); assert.equal(parsed.model_providers.yunqiao.base_url, 'http://127.0.0.1:3425/v1'); assert.equal(read(authFile), authBefore); });
+  check('leaving coexistence keeps the managed native catalog and switches to the API provider', () => { assert(exited.ok, exited.message); const parsed = parseToml(configFile); assert.equal(parsed.model_provider, 'yunqiao'); assert.equal(parsed.model, `${supplier.id}/relay-model`); assert.equal(parsed.profiles['work.v2'].model_provider, 'yunqiao'); assert.equal(parsed.profiles['work.v2'].permissions[0], 'read'); assert.equal(parsed.openai_base_url, undefined); assert.equal(parsed.model_catalog_json, catalogFile); assert.equal(parsed.profiles['work.v2'].openai_base_url, undefined); assert.equal(parsed.profiles['work.v2'].model_catalog_json, undefined); assert.equal(parsed.model_providers.yunqiao.base_url, 'http://127.0.0.1:3425/v1'); assert.equal(read(authFile), authBefore); });
   const restored = await api.runAction(deps, 'agent.disconnect', { agentId: 'codex-desktop' });
   check('disconnect restores the original config byte for byte', () => { assert(restored.ok, restored.message); assert.equal(read(configFile), originalConfig); assert.equal(read(authFile), authBefore); });
 
@@ -152,8 +152,8 @@ try {
   store.saveProvider({ id: supplier.id, models: supplier.models, apiKeys: supplier.apiKeys });
 
   write(configFile, originalConfig);
-  const apiOnly = await api.runAction(deps, 'agent.connect', { agentId: 'codex-cli', providerId: supplier.id, model: 'relay-model', authMode: 'api' });
-  check('normal API mode preserves unrelated active-profile endpoint and catalog', () => { assert(apiOnly.ok, apiOnly.message); const parsed = parseToml(configFile); assert.equal(parsed.openai_base_url, 'https://old.invalid/v1'); assert.equal(parsed.model_catalog_json, 'C:/old/catalog.json'); assert.equal(parsed.profiles['work.v2'].openai_base_url, 'https://profile-old.invalid/v1'); assert.equal(parsed.profiles['work.v2'].model_catalog_json, 'C:/profile-old/catalog.json'); });
+  const apiOnly = await api.runAction(deps, 'agent.connect', { agentId: 'codex-cli', providerId: supplier.id, model: 'relay-model', authMode: 'api', mode: 'direct' });
+  check('direct API mode preserves unrelated active-profile endpoint and catalog', () => { assert(apiOnly.ok, apiOnly.message); const parsed = parseToml(configFile); assert.equal(parsed.openai_base_url, 'https://old.invalid/v1'); assert.equal(parsed.model_catalog_json, 'C:/old/catalog.json'); assert.equal(parsed.profiles['work.v2'].openai_base_url, 'https://profile-old.invalid/v1'); assert.equal(parsed.profiles['work.v2'].model_catalog_json, 'C:/profile-old/catalog.json'); });
   const installedConfig = read(configFile);
   const externallyEdited = installedConfig + '\n# external edit since the stored backup\n';
   write(configFile, externallyEdited);

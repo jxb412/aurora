@@ -92,6 +92,31 @@ try {
     assert.ok(!JSON.stringify(catalog).includes('must-not-copy'));
     assert.equal(m.desktopModelCatalog(store).codex_model_provider, 'openai');
   });
+  await test('共存原生和扩展目录复用显式等级，不继承官方能力且否决优先', () => {
+    const models = [
+      { id: 'gpt-fixture', supportedReasoningEfforts: ['max', 'high', 'high'] },
+      { id: 'explicit-medium', supportedReasoningEfforts: ['max', 'medium', 'low'] },
+      { id: 'disabled', supportedReasoningEfforts: ['max'], capabilities: { thinking: false } },
+      { id: 'field-none', supportedReasoningEfforts: ['max'], thinkingField: 'none' },
+      { id: 'gpt-5-empty', supportedReasoningEfforts: [] },
+      { id: 'gpt-5.1-codex-max' },
+    ];
+    try {
+      store.saveProvider({ id: supplier.id, models });
+      const catalog = m.getCoexistCatalog(store), desktop = m.desktopModelCatalog(store);
+      const expected = [['high', 'max'], ['low', 'medium', 'max'], [], [], [], ['none']];
+      const defaults = ['high', 'medium', null, null, null, 'none'];
+      models.forEach((model, index) => {
+        const id = `${supplier.id}/${model.id}`, native = catalog.nativeCatalog.models.find(entry => entry.slug === id);
+        assert.deepEqual(native.supported_reasoning_levels.map(level => level.effort), expected[index]);
+        assert.equal(native.default_reasoning_level, defaults[index]);
+        assert.deepEqual(desktop.modelMetadata[id].supportedReasoningEfforts.map(level => level.reasoningEffort), expected[index]);
+        assert.equal(desktop.modelMetadata[id].defaultReasoningEffort ?? null, defaults[index]);
+      });
+      assert.equal(catalog.nativeCatalog.models[0].default_reasoning_level, 'high');
+      assert.deepEqual(catalog.nativeCatalog.models[0].supported_reasoning_levels, [{ effort: 'high', description: 'High' }]);
+    } finally { store.saveProvider({ id: supplier.id, models: supplier.models }); }
+  });
   await test('rewritten cache never promotes relay IDs or duplicates official prefixes', () => {
     const cacheFile = path.join(nativeHome, 'models_cache.json'), initial = fs.readFileSync(cacheFile, 'utf8');
     const catalog = m.getCoexistCatalog(store);

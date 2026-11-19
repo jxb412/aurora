@@ -6,6 +6,7 @@ import * as zlib from 'node:zlib';
 import { parse } from 'smol-toml';
 import { codexHome } from '../codex.js';
 import { applyContextDefaults, defaultAutoCompactTokenLimit, isValidContextWindow } from '../modelContext.js';
+import { reasoningLevels } from '../agents/modelCatalog.js';
 import type { AuroraStore } from '../store/index.js';
 import { parseCodexHistoryRoute, type CodexHistoryTarget } from './historyRoute.js';
 
@@ -252,9 +253,12 @@ export function getCoexistCatalog(store: AuroraStore, persist = true): CoexistCa
       // Keep the actual local client's schema, but do not advertise capabilities merely inherited from an official model.
       const template = native[0] ? structuredClone(native[0]) : {};
       for (const key of ['multi_agent_version', 'use_responses_lite', 'supports_image_detail_original']) delete template[key];
+      const levels = Array.isArray(model.supportedReasoningEfforts) ? reasoningLevels(model) : [];
       nativeModels.push({ ...template, slug: id, display_name: displayName, description: `${provider.name} / ${model.id}`,
         base_instructions: '', model_messages: null, priority: 1000 + nativeModels.length, visibility: 'list', supported_in_api: true,
-        default_reasoning_level: 'none', supported_reasoning_levels: [{ effort: 'none', description: '使用供应商默认行为' }],
+        default_reasoning_level: levels.includes('medium') ? 'medium' : levels[0] ?? (Array.isArray(model.supportedReasoningEfforts) ? null : 'none'),
+        supported_reasoning_levels: Array.isArray(model.supportedReasoningEfforts)
+          ? levels.map(effort => ({ effort, description: effort })) : [{ effort: 'none', description: '使用供应商默认行为' }],
         additional_speed_tiers: [], service_tiers: [], availability_nux: null, upgrade: null,
         supports_parallel_tool_calls: false, supports_reasoning_summaries: false, support_verbosity: false,
         experimental_supported_tools: [], supports_search_tool: false, supports_tool_search: false,

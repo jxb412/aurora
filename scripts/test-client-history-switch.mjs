@@ -101,7 +101,7 @@ function fixture(root, api, hooks = {}, initialize = true) {
       write(stateFile, json(state));
       if (hooks.crash === 'committing') process.exit(74);
       if (hooks.failCommit) throw new Error('fixture-commit-secret-must-not-escape');
-      return { ok: true, fixture: 'committed' };
+      return hooks.commitReply ?? { ok: true, fixture: 'committed' };
     } };
   return { root, home, dataDir, config, catalog, historyFile, stateFile, events, options, recovery,
     original() { assert.equal(read(config), beforeConfig); assert.equal(read(catalog), '{"model":"old"}'); assert.equal(read(historyFile), 'private history before\n'); assert.deepEqual(decode(stateFile), beforeState); } };
@@ -153,6 +153,44 @@ try {
     assert.equal(result.ok, false); assert.equal(result.rolledBack, true); clean(result); f.original();
     assert(f.events.indexOf('history-restore') < f.events.indexOf('config-rollback'));
     assert.equal(decode(result.journalPath).status, 'rolled-back');
+  });
+  await check('提交失败保留已知配置保护提示并返回准确的回滚元数据', async () => {
+    for (const [message, expected] of [
+      ['配置在上次接入后有外部修改，请先处理冲突：fixture-private-path/fixture-private-key', '配置在上次接入后有外部修改，请先处理冲突'],
+      ['首次接入前备份校验失败，已停止切换', '首次接入前备份校验失败，已停止切换'],
+    ]) {
+      const f = make({ noHistory: true, commitReply: { ok: false, message } });
+      const result = await api.runClientHistorySwitch({ ...f.options, configurationOnly: true });
+      assert.equal(result.ok, false); assert.equal(result.code, 'CLIENT_HISTORY_FAILED');
+      assert.equal(result.message, expected + '。本次配置修改已回滚。');
+      assert.equal(result.rolledBack, true); assert.equal(result.recoveryRequired, false);
+      assert(result.transactionId); assert.equal(decode(result.journalPath).status, 'rolled-back');
+      assert.equal(result.history, undefined); assert.equal(result.result, undefined);
+      assert(!f.events.includes('history-apply')); clean(result); f.original();
+    }
+  });
+  await check('任意提交错误及伪装为已知提示的敏感后缀不会泄露', async () => {
+    for (const message of [undefined, 'fixture-commit-secret-must-not-escape',
+      '首次接入前备份校验失败，已停止切换 fixture-private-key',
+      '配置在上次接入后有外部修改，请先处理冲突 fixture-private-key']) {
+      const f = make({ noHistory: true, commitReply: { ok: false, message, privateDetail: beforeConfig } });
+      const result = await api.runClientHistorySwitch({ ...f.options, configurationOnly: true });
+      assert.match(result.message, /^客户端配置保存失败.*本次配置修改已回滚。$/);
+      assert(!result.message.includes('历史')); assert.equal(result.rolledBack, true);
+      assert.equal(result.recoveryRequired, false); clean(result); f.original();
+    }
+  });
+  await check('提交保护错误遇到回滚冲突仍保留原因且不虚报回滚成功', async () => {
+    const message = '首次接入前备份校验失败，已停止切换';
+    const f = make({ noHistory: true });
+    f.options.commit = async () => { write(f.config, 'external-private-config'); return { ok: false, message }; };
+    const result = await api.runClientHistorySwitch({ ...f.options, configurationOnly: true });
+    assert.equal(result.code, 'CLIENT_HISTORY_RECOVERY_REQUIRED');
+    assert.equal(result.rolledBack, false); assert.equal(result.recoveryRequired, true);
+    assert(result.message.startsWith(message + '。')); assert.match(result.message, /未能自动回滚/);
+    assert(!result.message.includes('已回滚')); assert(!result.message.includes('历史'));
+    assert.equal(decode(result.journalPath).status, 'needs-recovery');
+    assert.equal(read(f.config), 'external-private-config'); assert(!f.events.includes('config-rollback')); clean(result);
   });
   await check('External config modification after migration preserves both histories and conflict contents until safe recovery', async () => {
     let f; f = make({ afterHistory: () => write(f.config, 'external-private-config') });

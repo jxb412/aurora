@@ -20,8 +20,8 @@ const server = http.createServer((_request, response) => {
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const endpoint = `http://127.0.0.1:${server.address().port}`;
 const store = new AuroraStore(path.join(scratch, 'data'));
-async function check(name, mutate, verify, response = { data: [{ id: 'existing', context_window: 999 }, { id: 'remove-me' }, { id: 'discovered', context_window: 128000 }] }) {
-  const provider = store.saveProvider({ name: 'before', baseUrl: endpoint, format: 'openai-chat', models: [{ id: 'existing', inputPrice: 2 }, { id: 'remove-me' }], apiKeys: [{ id: 'fixture', key: 'test-only-not-a-secret', enabled: true, weight: 1, label: 'test' }] });
+async function check(name, mutate, verify, response = { data: [{ id: 'existing', context_window: 999 }, { id: 'remove-me' }, { id: 'discovered', context_window: 128000 }] }, initialModels = [{ id: 'existing', inputPrice: 2 }, { id: 'remove-me' }]) {
+  const provider = store.saveProvider({ name: 'before', baseUrl: endpoint, format: 'openai-chat', models: initialModels, apiKeys: [{ id: 'fixture', key: 'test-only-not-a-secret', enabled: true, weight: 1, label: 'test' }] });
   const ready = new Promise(resolve => { received = resolve; });
   const pending = fetchProviderModels({ store }, { providerId: provider.id });
   await ready;
@@ -45,6 +45,59 @@ try {
     assert.deepEqual(current.models.map(m => m.id), ['existing', 'remove-me', 'good', 'bounded']);
     assert.equal(current.models[2].contextWindow, undefined); assert.equal(current.models[3].contextWindow, 32000);
   }, { data: [null, 5, { id: 12 }, { id: 'bad\nid' }, { id: 'good', context_window: -1 }, { id: 'good' }, { name: 'models/bounded', inputTokenLimit: 32000 }] });
+  await check('显式 reasoning 元数据规范化且不覆盖本地或并发能力设置', p => store.saveProvider({ ...p,
+    models: [{ id: 'existing', capabilities: { tools: true, thinking: false } }, { id: 'remove-me' }] }), (result, current) => {
+    assert.equal(result.ok, true);
+    const models = Object.fromEntries(current.models.map(model => [model.id, model]));
+    assert.deepEqual(models.existing.capabilities, { tools: true, thinking: false });
+    assert.equal(models['remove-me'].capabilities.thinking, true);
+    assert.equal(models['gpt-6.2-sol'].capabilities.thinking, true);
+    assert.equal(models['explicit-off'].capabilities.thinking, false);
+    assert.equal(models['capability-off'].capabilities.thinking, false);
+    assert.equal(models['unknown-reasoning'].capabilities, undefined);
+  }, { data: [
+    { id: 'existing', reasoning: true }, { id: 'remove-me', capabilities: { reasoning: true } },
+    { id: 'gpt-6.2-sol', reasoning: true }, { id: 'explicit-off', reasoning: false },
+    { id: 'capability-off', capabilities: { thinking: false, reasoning: true }, reasoning: true },
+    { id: 'unknown-reasoning', reasoning: 'true' },
+  ] });
+  await check('同步规范化显式等级并写入现有与新增模型，磁盘重载不丢失', () => {}, (result, current) => {
+    assert.equal(result.ok, true);
+    const models = Object.fromEntries(current.models.map(model => [model.id, model]));
+    assert.deepEqual(models.existing.supportedReasoningEfforts, ['low', 'medium', 'max']);
+    assert.deepEqual(models['remove-me'].supportedReasoningEfforts, ['high', 'xhigh', 'max']);
+    assert.deepEqual(models.discovered.supportedReasoningEfforts, ['minimal', 'max']);
+    assert.equal(models.discovered.thinkingField, 'reasoning_effort');
+    assert.deepEqual(models.empty.supportedReasoningEfforts, []);
+    assert.deepEqual(models.invalid.supportedReasoningEfforts, []);
+    assert.equal(models.malformed.supportedReasoningEfforts, undefined);
+    assert.equal(models.disabled.thinkingField, 'none');
+    assert.deepEqual(new AuroraStore(store.dir).getProvider(current.id).models, current.models);
+  }, { data: [
+    { id: 'existing', supportedReasoningEfforts: ['max', 'medium', 'low', 'max', 'invalid', null] },
+    { id: 'remove-me', supported_reasoning_efforts: ['max', 'xhigh', 'high'] },
+    { id: 'discovered', supportedReasoningEfforts: ['max', 'minimal'], thinkingField: 'reasoning_effort' },
+    { id: 'empty', supportedReasoningEfforts: [] }, { id: 'invalid', supportedReasoningEfforts: ['bogus', 5] },
+    { id: 'malformed', supportedReasoningEfforts: 'max' },
+    { id: 'disabled', supportedReasoningEfforts: ['max'], thinkingField: 'none' },
+  ] });
+  for (const remote of [{ data: [{ id: 'existing' }, { id: 'remove-me' }] },
+    { data: [{ id: 'existing', supportedReasoningEfforts: ['low'] }, { id: 'remove-me', supportedReasoningEfforts: ['max'] }] }]) {
+    await check('刷新缺省或冲突列表均保留已保存的显式等级和空列表', () => {}, (result, current) => {
+      assert.equal(result.ok, true);
+      assert.deepEqual(current.models[0].supportedReasoningEfforts, ['high', 'max']);
+      assert.equal(current.models[0].thinkingField, 'none');
+      assert.deepEqual(current.models[1].supportedReasoningEfforts, []);
+      assert.deepEqual(new AuroraStore(store.dir).getProvider(current.id).models, current.models);
+    }, remote, [{ id: 'existing', supportedReasoningEfforts: ['high', 'max'], thinkingField: 'none' }, { id: 'remove-me', supportedReasoningEfforts: [] }]);
+  }
+  await check('延迟模型响应不覆盖并发编辑的等级列表或 thinkingField', p => store.saveProvider({ ...p,
+    models: [{ id: 'existing', supportedReasoningEfforts: ['max'], thinkingField: 'none' }, { id: 'remove-me', supportedReasoningEfforts: [] }] }), (result, current) => {
+    assert.equal(result.ok, true);
+    assert.deepEqual(current.models[0].supportedReasoningEfforts, ['max']);
+    assert.equal(current.models[0].thinkingField, 'none');
+    assert.deepEqual(current.models[1].supportedReasoningEfforts, []);
+  }, { data: [{ id: 'existing', supportedReasoningEfforts: ['medium'], thinkingField: 'reasoning_effort' }, { id: 'remove-me', supportedReasoningEfforts: ['max'] }] });
   const original = store.saveProvider.bind(store);
   try {
     await check('Local persistence errors remain explicit without retrying another endpoint', () => { store.saveProvider = () => { throw new Error('fixture full disk'); }; }, (result, current) => {

@@ -18,6 +18,8 @@ export interface ProviderModel {
     vision?: boolean;
     thinking?: boolean;
   };
+  /** 显式支持的推理等级；空列表表示不启用推理等级选择。 */
+  supportedReasoningEfforts?: string[];
   /** 思考参数写法（DeepSeek 系用 enable_thinking） */
   thinkingField?: 'reasoning_effort' | 'enable_thinking' | 'none';
 }

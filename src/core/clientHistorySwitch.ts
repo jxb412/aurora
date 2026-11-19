@@ -25,7 +25,7 @@ export interface ClientHistorySwitchRecoveryOptions {
   /** Must CAS both config/catalog and the managed store slice against before/after. */
   rollbackConfig(snapshot: ClientHistorySwitchSnapshot): Promise<{ ok: boolean; message?: string }>;
 }
-export interface ClientHistorySwitchOptions<T extends { ok: boolean }> extends ClientHistorySwitchRecoveryOptions {
+export interface ClientHistorySwitchOptions<T extends { ok: boolean; message?: string }> extends ClientHistorySwitchRecoveryOptions {
   snapshot: ClientHistorySwitchSnapshot;
   historyRevision: string;
   historyInput?: Record<string, unknown>;
@@ -284,9 +284,17 @@ function failure(error: unknown, configurationOnly = false): ClientHistorySwitch
     message: error instanceof SwitchError ? error.message : '客户端配置切换未完成，已保留当前配置和备份，请检查后重试。' };
 }
 
+function safeCommitFailure(message: unknown): string {
+  // 仅返回固定的已知保护提示；动态路径和任意错误内容均不向用户透传。
+  const conflictMessage = '配置在上次接入后有外部修改，请先处理冲突';
+  if (typeof message === 'string' && (message === conflictMessage || message.startsWith(conflictMessage + '：'))) return conflictMessage;
+  const known = ['配置刚被其他程序修改，请重新预览', '首次接入前的备份已丢失，已停止切换', '首次接入前备份校验失败，已停止切换', '原始配置备份校验失败，已停止恢复'];
+  return known.find(value => value === message) ?? '客户端配置保存失败，请检查配置冲突、备份验证和目录权限后重试';
+}
+
 /** Durable history-first transaction. This module never starts or terminates a client. */
-export async function runClientHistorySwitch<T extends { ok: boolean }>(options: ClientHistorySwitchOptions<T>): Promise<ClientHistorySwitchResult<T>> {
-  let release: (() => void) | undefined, c: Context | undefined, owned: OwnedJournal | undefined, history: ClientHistoryApplyReply | undefined;
+export async function runClientHistorySwitch<T extends { ok: boolean; message?: string }>(options: ClientHistorySwitchOptions<T>): Promise<ClientHistorySwitchResult<T>> {
+  let release: (() => void) | undefined, c: Context | undefined, owned: OwnedJournal | undefined, history: ClientHistoryApplyReply | undefined, commitFailure: string | undefined;
   try {
     c = context(options, false);
     if (!fs.statSync(c.dataDir).isDirectory()) throw conflict();
@@ -335,7 +343,10 @@ export async function runClientHistorySwitch<T extends { ok: boolean }>(options:
       const next = canonicalSnapshot(c!, { ...owned!.value.snapshot, stateAfter });
       owned!.value.snapshot = next; owned!.value.snapshotHash = hash(next); save(c!, owned!);
     } });
-    if (!result?.ok) throw new SwitchError('CLIENT_HISTORY_FAILED', '客户端配置保存失败，正在恢复本次历史和配置修改。');
+    if (!result?.ok) {
+      commitFailure = safeCommitFailure(result?.message);
+      throw new SwitchError('CLIENT_HISTORY_FAILED', commitFailure);
+    }
     checkFiles(c, owned.value.snapshot, false, true);
     owned.value.status = 'complete'; save(c, owned);
     return { ok: true, result, transactionId: id, journalPath: owned.file, history,
@@ -345,7 +356,8 @@ export async function runClientHistorySwitch<T extends { ok: boolean }>(options:
     if (!c || !owned || !owned.text) return outcome;
     const rolledBack = await recoverOne(c, options, owned);
     return { ...outcome, transactionId: owned.value.id, journalPath: owned.file, history, rolledBack, recoveryRequired: !rolledBack,
-      ...(!rolledBack ? { code: 'CLIENT_HISTORY_RECOVERY_REQUIRED' as const, message: options.configurationOnly ? '配置保存遇到外部修改或读写故障，原始备份已保留。请检查配置文件与目录权限后重试。' : '本次配置或历史切换未完成，存在冲突或客户端仍在运行。备份和事务记录已保留，请退出客户端后重试恢复。' } : {}) };
+      ...(!rolledBack ? { code: 'CLIENT_HISTORY_RECOVERY_REQUIRED' as const, message: options.configurationOnly ? '配置保存遇到外部修改或读写故障，原始备份已保留。请检查配置文件与目录权限后重试。' : '本次配置或历史切换未完成，存在冲突或客户端仍在运行。备份和事务记录已保留，请退出客户端后重试恢复。' } : {}),
+      ...(commitFailure ? { message: `${commitFailure}。${rolledBack ? '本次配置修改已回滚。' : '本次配置修改未能自动回滚，外部修改、备份和事务记录已保留，请检查后重试恢复。'}` } : {}) };
   } finally { release?.(); }
 }
 

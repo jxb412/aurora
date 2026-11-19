@@ -9,6 +9,7 @@ import { applyContextDefaults, isChatgptTextModel, isValidContextWindow } from '
 import { readText, atomicWrite, digest, expectedPlanFiles, planned, restorePlanSnapshot } from './agents/configFiles.js';
 import { runPermissionAction } from './agents/permissions.js';
 import { getCoexistCatalog } from './gateway/coexist.js';
+import { buildGatewayModelCatalog, normalizeReasoningEfforts } from './agents/modelCatalog.js';
 import { runExtensionAction } from './extensions/index.js';
 import { AGENT_ADAPTERS, detectReset, getAdapter, connectionParameters, exportEnvScript, configureDesktopPath, codexPlan, planRevision, type ConnectContext } from './agents/adapters.js';
 import { detectAllAsync, detectDesktopAsync } from './agents/detectionAsync.js';
@@ -251,7 +252,13 @@ export async function fetchProviderModels(deps: ActionDeps, payload: { providerI
         const id = rawId.replace(/^models\//, '').trim();
         if (!id || id.length > 512 || /[\s\u0000-\u001f]/.test(id)) return [];
         const context = x.context_window ?? x.input_token_limit ?? x.inputTokenLimit;
-        return [{ id, ...(isValidContextWindow(context) ? { contextWindow: context } : {}) }];
+        const thinking = [x.capabilities?.thinking, x.capabilities?.reasoning, x.reasoning].find(value => typeof value === 'boolean');
+        const efforts = normalizeReasoningEfforts(x.supportedReasoningEfforts ?? x.supported_reasoning_efforts);
+        const thinkingField = ['reasoning_effort', 'enable_thinking', 'none'].includes(x.thinkingField) ? x.thinkingField as 'reasoning_effort' | 'enable_thinking' | 'none' : undefined;
+        return [{ id, ...(isValidContextWindow(context) ? { contextWindow: context } : {}),
+          ...(efforts !== undefined ? { supportedReasoningEfforts: efforts } : {}),
+          ...(thinkingField !== undefined ? { thinkingField } : {}),
+          ...(typeof thinking === 'boolean' ? { capabilities: { thinking } } : {}) }];
       });
       if (models.length) {
         // A network response must not restore a deleted provider or overwrite edits made while it was loading.
@@ -264,6 +271,15 @@ export async function fetchProviderModels(deps: ActionDeps, payload: { providerI
           if (index >= 0) {
             // Existing explicit limits are local choices; synchronization never replaces them.
             if (merged[index].contextWindow === undefined && isChatgptTextModel(m.id)) merged[index] = applyContextDefaults({ ...merged[index], contextWindow: m.contextWindow });
+            if (merged[index].supportedReasoningEfforts === undefined && m.supportedReasoningEfforts !== undefined) {
+              merged[index] = { ...merged[index], supportedReasoningEfforts: m.supportedReasoningEfforts };
+            }
+            if (merged[index].thinkingField === undefined && m.thinkingField !== undefined) {
+              merged[index] = { ...merged[index], thinkingField: m.thinkingField };
+            }
+            if (merged[index].capabilities?.thinking === undefined && m.capabilities?.thinking !== undefined) {
+              merged[index] = { ...merged[index], capabilities: { ...merged[index].capabilities, thinking: m.capabilities.thinking } };
+            }
           } else if (!(startedModels.has(m.id) && !current.models.some(x => x.id === m.id))) merged.push(applyContextDefaults(m));
         }
         let savedModels = merged;
@@ -568,9 +584,11 @@ export async function runAction(deps: ActionDeps, action: string, payload: any):
       const reviewedConnectionRevision = sharedCodex ? clientConnectionRevision(deps) : '';
       const preview: ReturnType<typeof adapter.preview> & { history?: PreparedClientHistory['history'] } = adapter.preview(context);
       const clientRevision = preview.revision;
-      // A coexistence apply also publishes the model catalog. Bind that content
-      // to the review even when a changed model limit leaves config.toml identical.
-      if (coexist && clientRevision) preview.revision = digest(JSON.stringify({ clientRevision, nativeCatalog: coexist.nativeCatalog }));
+      const nativeCatalog = coexist?.nativeCatalog ?? (sharedCodex && authMode === 'api' && context.mode === 'gateway' ? buildGatewayModelCatalog(provider) : undefined);
+      if (nativeCatalog && !coexist && !nativeCatalog.models.some(model => model.slug === `${provider.id}/${context.model}`)) return { ...preview, ok: false, message: '所选模型不是当前供应商可用的文本模型，请检查供应商和模型设置。' };
+      const catalogPlan = nativeCatalog ? planned(context.modelCatalogPath!, JSON.stringify(nativeCatalog, null, 2)) : undefined;
+      // 将目录内容和磁盘快照一起绑定到预览，防止目录独立修改后覆盖外部工作。
+      if (catalogPlan && clientRevision) preview.revision = digest(JSON.stringify({ clientRevision, catalogRevision: planRevision([catalogPlan]) }));
       let history: PreparedClientHistory | undefined;
       if (sharedCodex && preview.ok && action !== 'agent.parameters') {
         const prepared = await prepareClientHistory(deps, codexPlan(context)[0].after, action === 'agent.preview');
@@ -589,15 +607,17 @@ export async function runAction(deps: ActionDeps, action: string, payload: any):
       if (history) {
         const files = codexPlan(context);
         if (planRevision(files) !== clientRevision) return { ok: false, message: '配置在检查历史期间已变化，请重新预览' };
-        if (coexist) files.push(planned(catalogFile, JSON.stringify(coexist.nativeCatalog, null, 2)));
+        if (catalogPlan) files.push(catalogPlan);
         return await applyClientHistory(deps, {
           prepared: history, files,
           revalidate: () => {
-            if (clientConnectionRevision(deps) !== reviewedConnectionRevision || planRevision(codexPlan(context)) !== clientRevision || (coexist && digest(JSON.stringify(getCoexistCatalog(store).nativeCatalog)) !== digest(JSON.stringify(coexist.nativeCatalog))))
+            const liveCatalog = coexist ? getCoexistCatalog(store).nativeCatalog : nativeCatalog ? buildGatewayModelCatalog(store.getProvider(provider.id)!) : undefined;
+            if (clientConnectionRevision(deps) !== reviewedConnectionRevision || planRevision(codexPlan(context)) !== clientRevision
+              || (catalogPlan && (planRevision([planned(catalogFile, JSON.stringify(liveCatalog, null, 2))]) !== planRevision([catalogPlan]))))
               throw new Error('配置或模型目录在检查后已变化');
           },
           commit: () => {
-            if (coexist) atomicWrite(catalogFile, files[1].after, { existed: files[1].existed, content: files[1].before });
+            if (catalogPlan) atomicWrite(catalogFile, catalogPlan.after, { existed: catalogPlan.existed, content: catalogPlan.before });
             return adapter.connect(context);
           },
           states: result => CODEX_STATE_IDS.map(id => ({ id, connected: true, pendingReapply: false, providerId: provider.id, model: context.model,

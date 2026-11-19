@@ -1,6 +1,7 @@
 import https from 'node:https';
 import http from 'node:http';
 import { isValidContextWindow } from './modelContext.js';
+import { normalizeReasoningEfforts } from './agents/modelCatalog.js';
 import { createHash } from 'node:crypto';
 import { URL } from 'node:url';
 import type { AuroraStore, Provider, ProviderModel } from './store/index.js';
@@ -139,6 +140,8 @@ export function validateCloudProvider(raw: unknown): CloudProvider {
     }
     return {
       id: m.id.trim(), displayName: optionalText(m.displayName, 160), contextWindow: isValidContextWindow(m.contextWindow) ? m.contextWindow : undefined, maxOutput: number(m.maxOutput), inputPrice: number(m.inputPrice), outputPrice: number(m.outputPrice), cacheReadPrice: number(m.cacheReadPrice), cacheWritePrice: number(m.cacheWritePrice),
+      ...(Array.isArray(m.supportedReasoningEfforts) ? { supportedReasoningEfforts: normalizeReasoningEfforts(m.supportedReasoningEfforts) } : {}),
+      ...(['reasoning_effort', 'enable_thinking', 'none'].includes(m.thinkingField) ? { thinkingField: m.thinkingField as ProviderModel['thinkingField'] } : {}),
       capabilities: {
         tools: typeof m.capabilities?.tools === 'boolean' ? m.capabilities.tools : undefined,
         vision: typeof m.capabilities?.vision === 'boolean' ? m.capabilities.vision : undefined,

@@ -260,6 +260,22 @@ try {
     assert.equal(read(json(result.backup).files[0].backup), originalConfig);
   });
 
+  await check('实际配置冲突和原始备份校验失败的提示经动作层保留，且仅回滚本次配置', async () => {
+    for (const kind of ['external-config', 'backup-integrity']) {
+      const f = fixture('protected-config-' + kind); f.add(29);
+      const first = await f.connect(); assert(first.ok, first.message);
+      if (kind === 'external-config') write(f.config, read(f.config) + '\n# fixture-external-secret\n');
+      else write(json(first.backup).files[0].backup, 'fixture-external-secret');
+      const before = snapshot(f), result = await f.connect({ model: 'model-two' });
+      assert.equal(result.ok, false); assert.equal(result.code, 'CLIENT_HISTORY_FAILED');
+      assert.match(result.message, kind === 'external-config' ? /配置在上次接入后有外部修改，请先处理冲突/ : /首次接入前备份校验失败，已停止切换/);
+      assert.match(result.message, /本次配置修改已回滚/); assert(!result.message.includes('历史'));
+      assert.equal(result.rolledBack, true); assert.equal(result.recoveryRequired, false);
+      assert(result.recoveryPath); assert.equal(json(result.recoveryPath).status, 'rolled-back');
+      assertSnapshot(f, before); noSecrets(result);
+    }
+  });
+
   await check('API to coexist to API to disconnect keeps all history visible under each resulting provider and restores exact original config', async () => {
     const f = fixture('round-trip'); f.add(30); f.add(31, { archived: true });
     for (const patch of [{}, { authMode: 'coexist' }, { authMode: 'api', mode: 'direct', model: 'model-two' }]) {
